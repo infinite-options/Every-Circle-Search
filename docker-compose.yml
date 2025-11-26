@@ -1,0 +1,36 @@
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.11.0
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - plugins.security.disabled=true   # disable SSL for dev
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - os-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    networks:
+      - opennet
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:2.11.0
+    container_name: dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch:9200
+    networks:
+      - opennet
+
+volumes:
+  os-data:
+
+networks:
+  opennet:
