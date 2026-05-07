@@ -12,6 +12,7 @@ zappa*
 
 # misc
 .DS_Store
+.hf_cache/
 
 # . files
 .pem
