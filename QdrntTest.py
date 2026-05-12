@@ -88,6 +88,10 @@ LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
 
+# Business hybrid re-score: "rrf" = reciprocal rank fusion (semantic vs fuzzy-lexical); "legacy" = sem + token boost
+RESCORE_MODE = (os.getenv("RESCORE_MODE") or "rrf").strip().lower()
+RRF_K = _env_float("RRF_K", 60.0)
+
 
 def filter_relevant_hits(hits):
     """
@@ -241,6 +245,84 @@ def business_lexical_score(query, row):
     score += 0.22 * fuzzy_norm(query, " ".join(custom_tags))
 
     return min(1.0, score)
+
+
+def apply_business_rescore(query, merged_candidates):
+    """
+    Produce final `score` and `score_breakdown` for each merged business row.
+
+    - rrf (default): reciprocal rank fusion of (1) Qdrant semantic order and
+      (2) fuzzy lexical score order. Scores are normalized to ~[0, 1] so existing
+      MIN_SIMILARITY_SCORE / RELATIVE_SCORE_FACTOR filters stay meaningful.
+    - legacy: previous behavior — semantic cosine plus additive token/phrase boost.
+    """
+    if not merged_candidates:
+        return merged_candidates
+
+    if RESCORE_MODE == "legacy":
+        for merged in merged_candidates:
+            sem_score = safe_float(merged.pop("_sem_score", None))
+            if sem_score is None:
+                sem_score = safe_float(merged.get("score")) or 0.0
+            lexical_details = business_lexical_details(query, merged)
+            final_score = sem_score + lexical_details["total_lexical_boost"]
+            merged["score"] = final_score
+            merged["score_breakdown"] = {
+                "rescore_mode": "legacy",
+                "semantic_score": sem_score,
+                "lexical_fuzzy_score": business_lexical_score(query, merged),
+                **lexical_details,
+                "final_score": final_score,
+            }
+        return merged_candidates
+
+    n = len(merged_candidates)
+    sem_scores = []
+    lex_scores = []
+    for merged in merged_candidates:
+        sem = safe_float(merged.pop("_sem_score", None))
+        if sem is None:
+            sem = safe_float(merged.get("score")) or 0.0
+        sem_scores.append(sem)
+        lex_scores.append(business_lexical_score(query, merged))
+
+    uid_key = lambda i: str(merged_candidates[i].get("business_uid") or "")
+    sem_order = sorted(
+        range(n),
+        key=lambda i: (-(sem_scores[i] or 0.0), -(lex_scores[i] or 0.0), uid_key(i)),
+    )
+    lex_order = sorted(
+        range(n),
+        key=lambda i: (-(lex_scores[i] or 0.0), -(sem_scores[i] or 0.0), uid_key(i)),
+    )
+
+    rank_sem = [0] * n
+    rank_lex = [0] * n
+    for pos, i in enumerate(sem_order):
+        rank_sem[i] = pos + 1
+    for pos, i in enumerate(lex_order):
+        rank_lex[i] = pos + 1
+
+    k = RRF_K
+    max_raw = (2.0 / (k + 1.0)) if k > 0 else 0.0
+
+    for i, merged in enumerate(merged_candidates):
+        raw_rrf = (1.0 / (k + rank_sem[i])) + (1.0 / (k + rank_lex[i]))
+        norm_rrf = min(1.0, (raw_rrf / max_raw) if max_raw > 0 else 0.0)
+        lexical_details = business_lexical_details(query, merged)
+        merged["score"] = norm_rrf
+        merged["score_breakdown"] = {
+            "rescore_mode": "rrf",
+            "semantic_score": sem_scores[i],
+            "lexical_fuzzy_score": lex_scores[i],
+            **lexical_details,
+            "rrf_k": k,
+            "rrf_rank_semantic": rank_sem[i],
+            "rrf_rank_lexical": rank_lex[i],
+            "rrf_raw": raw_rrf,
+            "final_score": norm_rrf,
+        }
+    return merged_candidates
 
 
 def expertise_lexical_score(query, row):
@@ -759,23 +841,17 @@ def search_business():
 
             additional_info[row["business_uid"]] = row
 
-    # Build merged candidates first so lexical boost can influence relevance filtering.
+    # Build merged candidates; re-score (RRF or legacy) before relevance filtering.
     merged_candidates = []
     for r in results:
         uid = r.payload.get("business_uid")
-        merged = {"score": r.score, **r.payload}
+        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in additional_info:
             merged.update(additional_info[uid])
-        sem_score = safe_float(merged.get("score")) or 0.0
-        lexical_details = business_lexical_details(query, merged)
-        final_score = sem_score + lexical_details["total_lexical_boost"]
-        merged["score"] = final_score
-        merged["score_breakdown"] = {
-            "semantic_score": sem_score,
-            **lexical_details,
-            "final_score": final_score,
-        }
+            merged["_sem_score"] = safe_float(r.score) or 0.0
         merged_candidates.append(merged)
+
+    apply_business_rescore(query, merged_candidates)
 
     # Apply relevance cutoff AFTER lexical boost, then continue other filters.
     class _Hit:
@@ -1287,9 +1363,10 @@ def search_global():
     merged_business_results = []
     for r in biz_hits:
         uid = r.payload.get("business_uid")
-        merged = {"score": r.score, "itemType": "businesses", **r.payload}
+        merged = {"itemType": "businesses", **r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in biz_rows:
             merged.update(biz_rows[uid])
+            merged["_sem_score"] = safe_float(r.score) or 0.0
 
         rating = safe_float(merged.get("business_google_rating"))
         if rating is not None:
@@ -1298,16 +1375,9 @@ def search_global():
             if max_rating is not None and rating > max_rating:
                 continue
 
-        sem_score = safe_float(merged.get("score")) or 0.0
-        lexical_details = business_lexical_details(query, merged)
-        final_score = sem_score + lexical_details["total_lexical_boost"]
-        merged["score"] = final_score
-        merged["score_breakdown"] = {
-            "semantic_score": sem_score,
-            **lexical_details,
-            "final_score": final_score,
-        }
         merged_business_results.append(merged)
+
+    apply_business_rescore(query, merged_business_results)
 
     class _Hit:
         def __init__(self, payload):
