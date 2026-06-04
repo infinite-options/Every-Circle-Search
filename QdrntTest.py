@@ -87,6 +87,7 @@ RELATIVE_SCORE_FACTOR = _env_float("RELATIVE_SCORE_FACTOR", 0.60)
 LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
+SEARCH_DEFAULT_LIMIT = int(_env_float("SEARCH_DEFAULT_LIMIT", 120))
 
 # Business hybrid re-score: "rrf" = reciprocal rank fusion (semantic vs fuzzy-lexical); "legacy" = sem + token boost
 RESCORE_MODE = (os.getenv("RESCORE_MODE") or "rrf").strip().lower()
@@ -385,7 +386,7 @@ def safe_int(value):
 # ---------------------------------------------------------
 def get_limit(param, max_results):
     if param is None or param == "":
-        return 15
+        return SEARCH_DEFAULT_LIMIT
 
     value = str(param).strip().upper()
 
@@ -395,7 +396,7 @@ def get_limit(param, max_results):
     if value.isdigit():
         return int(value)
 
-    return 15
+    return SEARCH_DEFAULT_LIMIT
 
 
 # ---------------------------------------------------------
@@ -429,6 +430,22 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     return R * c
+
+
+def distance_filter_passes(user_lat, user_lon, max_distance, target_lat, target_lon):
+    """
+    Returns (include_row, distance_miles).
+    When max_distance is set, rows without target coordinates are excluded.
+    """
+    if user_lat is None or user_lon is None:
+        return True, None
+    dist = haversine_miles(user_lat, user_lon, target_lat, target_lon)
+    if max_distance is not None:
+        if dist is None:
+            return False, None
+        if dist > max_distance:
+            return False, dist
+    return True, dist
 
 
 # ---------------------------------------------------------
@@ -868,14 +885,17 @@ def search_business():
     # -----------------------------------------------------
     filtered = []
     for merged in boosted_candidates:
-        # Compute distance safely
-        if user_lat is not None and user_lon is not None:
-            dist = haversine_miles(user_lat, user_lon, merged.get("business_latitude"), merged.get("business_longitude"))
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            merged.get("business_latitude"),
+            merged.get("business_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
             merged["distance_miles"] = dist
-
-            if max_distance is not None and dist is not None:
-                if dist > max_distance:
-                    continue
 
         # Safely filter by rating
         rating = safe_float(merged.get("business_google_rating"))
@@ -1033,6 +1053,9 @@ def search_wishes():
 
     query = request.args.get("q", "")
     limit_param = request.args.get("limit")
+    user_lat = safe_float(request.args.get("user_lat"))
+    user_lon = safe_float(request.args.get("user_lon"))
+    max_distance = safe_float(request.args.get("max_distance"))
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
@@ -1099,6 +1122,18 @@ def search_wishes():
 
         if uid in additional_info:
             obj.update(additional_info[uid])
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            obj.get("profile_personal_latitude"),
+            obj.get("profile_personal_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            obj["distance_miles"] = dist
 
         response.append(obj)
 
@@ -1245,6 +1280,9 @@ def search_expertise():
 
     query = request.args.get("q", "")
     limit_param = request.args.get("limit")
+    user_lat = safe_float(request.args.get("user_lat"))
+    user_lon = safe_float(request.args.get("user_lon"))
+    max_distance = safe_float(request.args.get("max_distance"))
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
@@ -1311,6 +1349,18 @@ def search_expertise():
         if uid in additional_info:
             obj.update(additional_info[uid])
 
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            obj.get("profile_personal_latitude"),
+            obj.get("profile_personal_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            obj["distance_miles"] = dist
+
         response.append(obj)
 
     return jsonify(response)
@@ -1327,6 +1377,9 @@ def search_global():
 
     query = request.args.get("q", "")
     limit_param = request.args.get("limit")
+    user_lat = safe_float(request.args.get("user_lat"))
+    user_lon = safe_float(request.args.get("user_lon"))
+    max_distance = safe_float(request.args.get("max_distance"))
     min_rating = safe_float(request.args.get("min_rating"))
     max_rating = safe_float(request.args.get("max_rating"))
 
@@ -1374,6 +1427,18 @@ def search_global():
                 continue
             if max_rating is not None and rating > max_rating:
                 continue
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            merged.get("business_latitude"),
+            merged.get("business_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            merged["distance_miles"] = dist
 
         merged_business_results.append(merged)
 
@@ -1438,6 +1503,19 @@ def search_global():
         }
         if uid in exp_rows:
             merged.update(exp_rows[uid])
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            merged.get("profile_personal_latitude"),
+            merged.get("profile_personal_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            merged["distance_miles"] = dist
+
         expertise_results.append(merged)
 
     # Global ranking: prefer business intent by default, but keep expertise when truly relevant.
