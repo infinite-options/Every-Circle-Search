@@ -233,9 +233,10 @@ def business_lexical_score(query, row):
     name = row.get("business_name") or ""
     tagline = row.get("business_tag_line") or ""
     bio = row.get("business_short_bio") or ""
-    service_names = csv_to_tokens(row.get("all_service_names"))
-    service_tags = csv_to_tokens(row.get("all_service_tags"))
-    custom_tags = csv_to_tokens(row.get("all_custom_tags"))
+    # SQL lexical path uses all_* keys; Qdrant payload uses bs_* / custom_tags.
+    service_names = csv_to_tokens(row.get("all_service_names") or row.get("bs_service_names"))
+    service_tags = csv_to_tokens(row.get("all_service_tags") or row.get("bs_tags"))
+    custom_tags = csv_to_tokens(row.get("all_custom_tags") or row.get("custom_tags"))
 
     score = 0.0
     score += 0.30 * fuzzy_norm(query, name)
@@ -1529,6 +1530,97 @@ def search_global():
     combined = business_results + expertise_results
     combined.sort(key=lambda x: safe_float(x.get("global_score")) or 0.0, reverse=True)
     return jsonify(combined[:final_limit])
+
+
+# ---------------------------------------------------------
+# SEARCH SUGGEST (autocomplete) — swappable data sources
+# ---------------------------------------------------------
+SEARCH_SUGGEST_MIN_LEN = int(_env_float("SEARCH_SUGGEST_MIN_LEN", 2))
+SEARCH_SUGGEST_DEFAULT_LIMIT = int(_env_float("SEARCH_SUGGEST_DEFAULT_LIMIT", 8))
+SEARCH_SUGGEST_MAX_LIMIT = int(_env_float("SEARCH_SUGGEST_MAX_LIMIT", 20))
+SEARCH_SUGGEST_SOURCE = (os.getenv("SEARCH_SUGGEST_SOURCE") or "tags").strip().lower()
+
+
+def fetch_tag_suggestions(query, limit):
+    """
+    Tag-backed autocomplete. Replace or extend via SEARCH_SUGGEST_SOURCES.
+    """
+    q = (query or "").strip().lower()
+    if len(q) < SEARCH_SUGGEST_MIN_LEN:
+        return []
+
+    prefix_pattern = f"{q}%"
+    contains_pattern = f"%{q}%"
+
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute(
+        """
+        SELECT
+            t.tag_name,
+            COUNT(DISTINCT bt.bt_business_id) AS business_count
+        FROM tags t
+        LEFT JOIN business_tags bt ON bt.bt_tag_id = t.tag_uid
+        WHERE LOWER(t.tag_name) LIKE %s
+        GROUP BY t.tag_uid, t.tag_name
+        ORDER BY
+            CASE WHEN LOWER(t.tag_name) LIKE %s THEN 0 ELSE 1 END,
+            business_count DESC,
+            t.tag_name ASC
+        LIMIT %s
+        """,
+        (contains_pattern, prefix_pattern, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    suggestions = []
+    for row in rows:
+        tag_name = (row.get("tag_name") or "").strip()
+        if not tag_name:
+            continue
+        suggestions.append(
+            {
+                "text": tag_name,
+                "source": "tags",
+                "count": int(row.get("business_count") or 0),
+            }
+        )
+    return suggestions
+
+
+SEARCH_SUGGEST_SOURCES = {
+    "tags": fetch_tag_suggestions,
+}
+
+
+def get_search_suggestions(query, limit, source=None):
+    resolved_source = (source or SEARCH_SUGGEST_SOURCE or "tags").strip().lower()
+    provider = SEARCH_SUGGEST_SOURCES.get(resolved_source)
+    if not provider:
+        return [], resolved_source
+    return provider(query, limit), resolved_source
+
+
+@app.route("/search_suggest", methods=["GET"])
+def search_suggest():
+    query = (request.args.get("q") or "").strip()
+    source = (request.args.get("source") or "").strip().lower() or None
+
+    try:
+        limit = int(request.args.get("limit", SEARCH_SUGGEST_DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        limit = SEARCH_SUGGEST_DEFAULT_LIMIT
+    limit = max(1, min(limit, SEARCH_SUGGEST_MAX_LIMIT))
+
+    suggestions, resolved_source = get_search_suggestions(query, limit, source=source)
+    return jsonify(
+        {
+            "query": query,
+            "source": resolved_source,
+            "suggestions": suggestions,
+        }
+    )
 
 
 # ---------------------------------------------------------

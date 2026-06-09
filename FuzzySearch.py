@@ -102,9 +102,9 @@ def business_lexical_score(query, row):
     name = row.get("business_name") or ""
     tagline = row.get("business_tag_line") or ""
     bio = row.get("business_short_bio") or ""
-    service_names = csv_to_tokens(row.get("all_service_names"))
-    service_tags = csv_to_tokens(row.get("all_service_tags"))
-    custom_tags = csv_to_tokens(row.get("all_custom_tags"))
+    service_names = csv_to_tokens(row.get("all_service_names") or row.get("bs_service_names"))
+    service_tags = csv_to_tokens(row.get("all_service_tags") or row.get("bs_tags"))
+    custom_tags = csv_to_tokens(row.get("all_custom_tags") or row.get("custom_tags"))
 
     score = 0.0
     score += 0.30 * fuzzy_norm(query, name)
@@ -120,9 +120,9 @@ def business_lexical_breakdown(query, row):
     name = row.get("business_name") or ""
     tagline = row.get("business_tag_line") or ""
     bio = row.get("business_short_bio") or ""
-    service_names = csv_to_tokens(row.get("all_service_names"))
-    service_tags = csv_to_tokens(row.get("all_service_tags"))
-    custom_tags = csv_to_tokens(row.get("all_custom_tags"))
+    service_names = csv_to_tokens(row.get("all_service_names") or row.get("bs_service_names"))
+    service_tags = csv_to_tokens(row.get("all_service_tags") or row.get("bs_tags"))
+    custom_tags = csv_to_tokens(row.get("all_custom_tags") or row.get("custom_tags"))
 
     name_score = 0.30 * fuzzy_norm(query, name)
     tagline_score = 0.10 * fuzzy_norm(query, tagline)
