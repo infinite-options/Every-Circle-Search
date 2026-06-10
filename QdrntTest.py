@@ -88,6 +88,9 @@ LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
 SEARCH_DEFAULT_LIMIT = int(_env_float("SEARCH_DEFAULT_LIMIT", 120))
+# Soft proximity boost when user home coords are sent but no distance filter is active.
+PROXIMITY_BOOST_MILES = _env_float("PROXIMITY_BOOST_MILES", 5.0)
+PROXIMITY_BOOST_FACTOR = _env_float("PROXIMITY_BOOST_FACTOR", 1.12)
 
 # Business hybrid re-score: "rrf" = reciprocal rank fusion (semantic vs fuzzy-lexical); "legacy" = sem + token boost
 RESCORE_MODE = (os.getenv("RESCORE_MODE") or "rrf").strip().lower()
@@ -433,12 +436,26 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     return R * c
 
 
+def _coords_usable(lat, lon):
+    lat = safe_float(lat)
+    lon = safe_float(lon)
+    if lat is None or lon is None:
+        return False
+    if lat == 0.0 and lon == 0.0:
+        return False
+    return True
+
+
 def distance_filter_passes(user_lat, user_lon, max_distance, target_lat, target_lon):
     """
     Returns (include_row, distance_miles).
     When max_distance is set, rows without target coordinates are excluded.
     """
     if user_lat is None or user_lon is None:
+        return True, None
+    if not _coords_usable(target_lat, target_lon):
+        if max_distance is not None:
+            return False, None
         return True, None
     dist = haversine_miles(user_lat, user_lon, target_lat, target_lon)
     if max_distance is not None:
@@ -447,6 +464,40 @@ def distance_filter_passes(user_lat, user_lon, max_distance, target_lat, target_
         if dist > max_distance:
             return False, dist
     return True, dist
+
+
+def apply_home_proximity_boost(row, user_lat, user_lon, max_distance, lat_key, lon_key):
+    """
+    When home coords are provided without an explicit distance filter, boost rows
+    within PROXIMITY_BOOST_MILES and flag them for the client UI.
+    """
+    row["location_boosted"] = False
+    if user_lat is None or user_lon is None or max_distance is not None:
+        return
+
+    target_lat = row.get(lat_key)
+    target_lon = row.get(lon_key)
+    if not _coords_usable(target_lat, target_lon):
+        return
+
+    dist = haversine_miles(user_lat, user_lon, target_lat, target_lon)
+    if dist is not None:
+        row["distance_miles"] = dist
+
+    if dist is None or dist > PROXIMITY_BOOST_MILES:
+        return
+
+    base = safe_float(row.get("score")) or 0.0
+    boosted = base * PROXIMITY_BOOST_FACTOR
+    row["score"] = boosted
+    row["location_boosted"] = True
+
+    breakdown = row.get("score_breakdown")
+    if isinstance(breakdown, dict):
+        breakdown["proximity_boost"] = True
+        breakdown["proximity_boost_miles"] = dist
+        breakdown["proximity_boost_factor"] = PROXIMITY_BOOST_FACTOR
+        breakdown["final_score"] = boosted
 
 
 # ---------------------------------------------------------
@@ -898,6 +949,15 @@ def search_business():
         if dist is not None:
             merged["distance_miles"] = dist
 
+        apply_home_proximity_boost(
+            merged,
+            user_lat,
+            user_lon,
+            max_distance,
+            "business_latitude",
+            "business_longitude",
+        )
+
         # Safely filter by rating
         rating = safe_float(merged.get("business_google_rating"))
         if rating is not None:
@@ -907,9 +967,6 @@ def search_business():
                 continue
 
         filtered.append(merged)
-
-        if len(filtered) >= final_limit:
-            break
 
     filtered.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
     return jsonify(filtered[:final_limit])
@@ -1136,9 +1193,19 @@ def search_wishes():
         if dist is not None:
             obj["distance_miles"] = dist
 
+        apply_home_proximity_boost(
+            obj,
+            user_lat,
+            user_lon,
+            max_distance,
+            "profile_personal_latitude",
+            "profile_personal_longitude",
+        )
+
         response.append(obj)
 
-    return jsonify(response)
+    response.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
+    return jsonify(response[:final_limit])
 
 
 # ---------------------------------------------------------
@@ -1362,9 +1429,19 @@ def search_expertise():
         if dist is not None:
             obj["distance_miles"] = dist
 
+        apply_home_proximity_boost(
+            obj,
+            user_lat,
+            user_lon,
+            max_distance,
+            "profile_personal_latitude",
+            "profile_personal_longitude",
+        )
+
         response.append(obj)
 
-    return jsonify(response)
+    response.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
+    return jsonify(response[:final_limit])
 
 
 # ---------------------------------------------------------
@@ -1451,6 +1528,16 @@ def search_global():
             self.score = payload.get("score", 0.0)
 
     business_results = [h.payload for h in filter_relevant_hits([_Hit(m) for m in merged_business_results])]
+    for item in business_results:
+        apply_home_proximity_boost(
+            item,
+            user_lat,
+            user_lon,
+            max_distance,
+            "business_latitude",
+            "business_longitude",
+        )
+    business_results.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
 
     # --- expertise ---
     exp_hits = qdrant_vector_search("expertise", query_vector=vector, limit=max_results)
@@ -1516,6 +1603,15 @@ def search_global():
             continue
         if dist is not None:
             merged["distance_miles"] = dist
+
+        apply_home_proximity_boost(
+            merged,
+            user_lat,
+            user_lon,
+            max_distance,
+            "profile_personal_latitude",
+            "profile_personal_longitude",
+        )
 
         expertise_results.append(merged)
 
