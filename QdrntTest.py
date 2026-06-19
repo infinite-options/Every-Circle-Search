@@ -252,14 +252,12 @@ def business_lexical_score(query, row):
     return min(1.0, score)
 
 
-def apply_business_rescore(query, merged_candidates):
+def apply_hybrid_rescore(query, merged_candidates, lexical_score_fn, uid_field, lexical_details_fn=None):
     """
-    Produce final `score` and `score_breakdown` for each merged business row.
+    Produce final `score` and `score_breakdown` via semantic + fuzzy-lexical hybrid re-score.
 
-    - rrf (default): reciprocal rank fusion of (1) Qdrant semantic order and
-      (2) fuzzy lexical score order. Scores are normalized to ~[0, 1] so existing
-      MIN_SIMILARITY_SCORE / RELATIVE_SCORE_FACTOR filters stay meaningful.
-    - legacy: previous behavior — semantic cosine plus additive token/phrase boost.
+    - rrf (default): reciprocal rank fusion of Qdrant semantic order and fuzzy lexical order.
+    - legacy: semantic cosine plus lexical boost (token details for business, scaled fuzzy for others).
     """
     if not merged_candidates:
         return merged_candidates
@@ -269,16 +267,23 @@ def apply_business_rescore(query, merged_candidates):
             sem_score = safe_float(merged.pop("_sem_score", None))
             if sem_score is None:
                 sem_score = safe_float(merged.get("score")) or 0.0
-            lexical_details = business_lexical_details(query, merged)
-            final_score = sem_score + lexical_details["total_lexical_boost"]
+            lex_score = lexical_score_fn(query, merged)
+            if lexical_details_fn:
+                lexical_details = lexical_details_fn(query, merged)
+                final_score = sem_score + lexical_details["total_lexical_boost"]
+            else:
+                lexical_details = {}
+                final_score = sem_score + lex_score * 0.25
             merged["score"] = final_score
-            merged["score_breakdown"] = {
+            breakdown = {
                 "rescore_mode": "legacy",
                 "semantic_score": sem_score,
-                "lexical_fuzzy_score": business_lexical_score(query, merged),
-                **lexical_details,
+                "lexical_fuzzy_score": lex_score,
                 "final_score": final_score,
             }
+            if lexical_details:
+                breakdown.update(lexical_details)
+            merged["score_breakdown"] = breakdown
         return merged_candidates
 
     n = len(merged_candidates)
@@ -289,9 +294,9 @@ def apply_business_rescore(query, merged_candidates):
         if sem is None:
             sem = safe_float(merged.get("score")) or 0.0
         sem_scores.append(sem)
-        lex_scores.append(business_lexical_score(query, merged))
+        lex_scores.append(lexical_score_fn(query, merged))
 
-    uid_key = lambda i: str(merged_candidates[i].get("business_uid") or "")
+    uid_key = lambda i: str(merged_candidates[i].get(uid_field) or "")
     sem_order = sorted(
         range(n),
         key=lambda i: (-(sem_scores[i] or 0.0), -(lex_scores[i] or 0.0), uid_key(i)),
@@ -314,13 +319,13 @@ def apply_business_rescore(query, merged_candidates):
     for i, merged in enumerate(merged_candidates):
         raw_rrf = (1.0 / (k + rank_sem[i])) + (1.0 / (k + rank_lex[i]))
         norm_rrf = min(1.0, (raw_rrf / max_raw) if max_raw > 0 else 0.0)
-        lexical_details = business_lexical_details(query, merged)
+        extra = lexical_details_fn(query, merged) if lexical_details_fn else {}
         merged["score"] = norm_rrf
         merged["score_breakdown"] = {
             "rescore_mode": "rrf",
             "semantic_score": sem_scores[i],
             "lexical_fuzzy_score": lex_scores[i],
-            **lexical_details,
+            **extra,
             "rrf_k": k,
             "rrf_rank_semantic": rank_sem[i],
             "rrf_rank_lexical": rank_lex[i],
@@ -328,6 +333,43 @@ def apply_business_rescore(query, merged_candidates):
             "final_score": norm_rrf,
         }
     return merged_candidates
+
+
+def apply_business_rescore(query, merged_candidates):
+    return apply_hybrid_rescore(
+        query,
+        merged_candidates,
+        business_lexical_score,
+        "business_uid",
+        business_lexical_details,
+    )
+
+
+def apply_expertise_rescore(query, merged_candidates):
+    return apply_hybrid_rescore(
+        query,
+        merged_candidates,
+        expertise_lexical_score,
+        "profile_expertise_uid",
+    )
+
+
+def apply_wish_rescore(query, merged_candidates):
+    return apply_hybrid_rescore(
+        query,
+        merged_candidates,
+        wish_lexical_score,
+        "profile_wish_uid",
+    )
+
+
+def filter_rescored_candidates(merged_candidates):
+    class _Hit:
+        def __init__(self, payload):
+            self.payload = payload
+            self.score = payload.get("score", 0.0)
+
+    return [h.payload for h in filter_relevant_hits([_Hit(m) for m in merged_candidates])]
 
 
 def expertise_lexical_score(query, row):
@@ -623,6 +665,7 @@ def sync_businesses(biz_map):
         SELECT
             {", ".join(business_select_fields)}
         FROM business
+        WHERE business_is_active = 1
         """
     )
     rows = cur.fetchall()
@@ -819,6 +862,7 @@ def search_business_lexical():
         LEFT JOIN business_services bs ON bs.bs_business_id = b.business_uid
         LEFT JOIN business_tags bt ON bt.bt_business_id = b.business_uid
         LEFT JOIN tags t ON t.tag_uid = bt.bt_tag_id
+        WHERE b.business_is_active = 1
         GROUP BY b.business_uid
     """)
     rows = cur.fetchall()
@@ -893,6 +937,7 @@ def search_business():
             SELECT *
             FROM business
             WHERE business_uid IN ({placeholders})
+              AND business_is_active = 1
         """,
             business_uids,
         )
@@ -914,6 +959,8 @@ def search_business():
     merged_candidates = []
     for r in results:
         uid = r.payload.get("business_uid")
+        if business_uids and uid not in additional_info:
+            continue
         merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in additional_info:
             merged.update(additional_info[uid])
@@ -922,15 +969,7 @@ def search_business():
 
     apply_business_rescore(query, merged_candidates)
 
-    # Apply relevance cutoff AFTER lexical boost, then continue other filters.
-    class _Hit:
-        def __init__(self, payload):
-            self.payload = payload
-            self.score = payload.get("score", 0.0)
-
-    boosted_hits = [_Hit(m) for m in merged_candidates]
-    boosted_hits = filter_relevant_hits(boosted_hits)
-    boosted_candidates = [h.payload for h in boosted_hits]
+    boosted_candidates = filter_rescored_candidates(merged_candidates)
 
     # -----------------------------------------------------
     # APPLY FILTERS + ADD DISTANCE (SAFE)
@@ -1005,6 +1044,7 @@ def sync_wishes(wish_map):
         f"""
         SELECT {", ".join(wish_select_fields)}
         FROM profile_wish
+        WHERE profile_wish_is_public = 1
         """
     )
     rows = cur.fetchall()
@@ -1087,6 +1127,7 @@ def search_wishes_lexical():
             ON profile_personal_uid = profile_wish_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
+        WHERE profile_wish.profile_wish_is_public = 1
     """)
     rows = cur.fetchall()
     conn.close()
@@ -1121,8 +1162,6 @@ def search_wishes():
     vector = embed_text(query)
 
     results = qdrant_vector_search("wishes", query_vector=vector, limit=max_results)
-    results = filter_relevant_hits(results)
-    results = results[:final_limit]
 
     wish_uids = [r.payload.get("profile_wish_uid") for r in results]
 
@@ -1151,6 +1190,7 @@ def search_wishes():
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_wish_uid IN ({placeholders})
+              AND profile_wish_is_public = 1
         """,
             wish_uids,
         )
@@ -1165,22 +1205,22 @@ def search_wishes():
 
             additional_info[row["profile_wish_uid"]] = row
 
-    response = []
+    merged_candidates = []
     for r in results:
         uid = r.payload.get("profile_wish_uid")
-        sem_score = safe_float(r.score) or 0.0
-        obj = {
-            "score": sem_score,
-            "score_breakdown": {
-                "semantic_score": sem_score,
-                "final_score": sem_score,
-            },
-            **r.payload,
-        }
-
+        if wish_uids and uid not in additional_info:
+            continue
+        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in additional_info:
-            obj.update(additional_info[uid])
+            merged.update(additional_info[uid])
+            merged["_sem_score"] = safe_float(r.score) or 0.0
+        merged_candidates.append(merged)
 
+    apply_wish_rescore(query, merged_candidates)
+    boosted_candidates = filter_rescored_candidates(merged_candidates)
+
+    response = []
+    for obj in boosted_candidates:
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
@@ -1192,15 +1232,6 @@ def search_wishes():
             continue
         if dist is not None:
             obj["distance_miles"] = dist
-
-        apply_home_proximity_boost(
-            obj,
-            user_lat,
-            user_lon,
-            max_distance,
-            "profile_personal_latitude",
-            "profile_personal_longitude",
-        )
 
         response.append(obj)
 
@@ -1242,6 +1273,7 @@ def sync_expertise(exp_map):
         f"""
         SELECT {", ".join(exp_select_fields)}
         FROM profile_expertise
+        WHERE profile_expertise_is_public = 1
         """
     )
     rows = cur.fetchall()
@@ -1324,6 +1356,7 @@ def search_expertise_lexical():
             ON profile_personal_uid = profile_expertise_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
+        WHERE profile_expertise.profile_expertise_is_public = 1
     """)
     rows = cur.fetchall()
     conn.close()
@@ -1358,8 +1391,6 @@ def search_expertise():
     vector = embed_text(query)
 
     results = qdrant_vector_search("expertise", query_vector=vector, limit=max_results)
-    results = filter_relevant_hits(results)
-    results = results[:final_limit]
 
     exp_uids = [r.payload.get("profile_expertise_uid") for r in results]
     additional_info = {}
@@ -1387,6 +1418,7 @@ def search_expertise():
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_expertise_uid IN ({placeholders})
+              AND profile_expertise_is_public = 1
         """,
             exp_uids,
         )
@@ -1401,22 +1433,22 @@ def search_expertise():
 
             additional_info[row["profile_expertise_uid"]] = row
 
-    response = []
+    merged_candidates = []
     for r in results:
         uid = r.payload.get("profile_expertise_uid")
-        sem_score = safe_float(r.score) or 0.0
-        obj = {
-            "score": sem_score,
-            "score_breakdown": {
-                "semantic_score": sem_score,
-                "final_score": sem_score,
-            },
-            **r.payload,
-        }
-
+        if exp_uids and uid not in additional_info:
+            continue
+        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in additional_info:
-            obj.update(additional_info[uid])
+            merged.update(additional_info[uid])
+            merged["_sem_score"] = safe_float(r.score) or 0.0
+        merged_candidates.append(merged)
 
+    apply_expertise_rescore(query, merged_candidates)
+    boosted_candidates = filter_rescored_candidates(merged_candidates)
+
+    response = []
+    for obj in boosted_candidates:
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
@@ -1428,15 +1460,6 @@ def search_expertise():
             continue
         if dist is not None:
             obj["distance_miles"] = dist
-
-        apply_home_proximity_boost(
-            obj,
-            user_lat,
-            user_lon,
-            max_distance,
-            "profile_personal_latitude",
-            "profile_personal_longitude",
-        )
 
         response.append(obj)
 
@@ -1478,6 +1501,7 @@ def search_global():
             SELECT *
             FROM business
             WHERE business_uid IN ({placeholders})
+              AND business_is_active = 1
         """,
             biz_uids,
         )
@@ -1494,6 +1518,8 @@ def search_global():
     merged_business_results = []
     for r in biz_hits:
         uid = r.payload.get("business_uid")
+        if biz_uids and uid not in biz_rows:
+            continue
         merged = {"itemType": "businesses", **r.payload, "_sem_score": safe_float(r.score) or 0.0}
         if uid in biz_rows:
             merged.update(biz_rows[uid])
@@ -1522,12 +1548,7 @@ def search_global():
 
     apply_business_rescore(query, merged_business_results)
 
-    class _Hit:
-        def __init__(self, payload):
-            self.payload = payload
-            self.score = payload.get("score", 0.0)
-
-    business_results = [h.payload for h in filter_relevant_hits([_Hit(m) for m in merged_business_results])]
+    business_results = filter_rescored_candidates(merged_business_results)
     for item in business_results:
         apply_home_proximity_boost(
             item,
@@ -1541,7 +1562,6 @@ def search_global():
 
     # --- expertise ---
     exp_hits = qdrant_vector_search("expertise", query_vector=vector, limit=max_results)
-    exp_hits = filter_relevant_hits(exp_hits)
     exp_uids = [r.payload.get("profile_expertise_uid") for r in exp_hits]
     exp_rows = {}
     if exp_uids:
@@ -1566,6 +1586,7 @@ def search_global():
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_expertise_uid IN ({placeholders})
+              AND profile_expertise_is_public = 1
         """,
             exp_uids,
         )
@@ -1576,21 +1597,19 @@ def search_global():
             row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
             exp_rows[row["profile_expertise_uid"]] = row
 
-    expertise_results = []
+    merged_expertise_results = []
     for r in exp_hits:
         uid = r.payload.get("profile_expertise_uid")
-        sem_score = safe_float(r.score) or 0.0
+        if exp_uids and uid not in exp_rows:
+            continue
         merged = {
-            "score": sem_score,
-            "score_breakdown": {
-                "semantic_score": sem_score,
-                "final_score": sem_score,
-            },
             "itemType": "expertise",
             **r.payload,
+            "_sem_score": safe_float(r.score) or 0.0,
         }
         if uid in exp_rows:
             merged.update(exp_rows[uid])
+            merged["_sem_score"] = safe_float(r.score) or 0.0
 
         include, dist = distance_filter_passes(
             user_lat,
@@ -1604,16 +1623,10 @@ def search_global():
         if dist is not None:
             merged["distance_miles"] = dist
 
-        apply_home_proximity_boost(
-            merged,
-            user_lat,
-            user_lon,
-            max_distance,
-            "profile_personal_latitude",
-            "profile_personal_longitude",
-        )
+        merged_expertise_results.append(merged)
 
-        expertise_results.append(merged)
+    apply_expertise_rescore(query, merged_expertise_results)
+    expertise_results = filter_rescored_candidates(merged_expertise_results)
 
     # Global ranking: prefer business intent by default, but keep expertise when truly relevant.
     for item in business_results:
