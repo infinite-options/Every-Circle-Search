@@ -542,6 +542,164 @@ def apply_home_proximity_boost(row, user_lat, user_lon, max_distance, lat_key, l
         breakdown["final_score"] = boosted
 
 
+def is_browse_query(query):
+    """Empty query = browse all public/active catalog items (no semantic search)."""
+    return not (query or "").strip()
+
+
+def fetch_browse_businesses(user_lat, user_lon, max_distance, min_rating, max_rating):
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute(
+        """
+        SELECT
+            b.*,
+            GROUP_CONCAT(DISTINCT bs.bs_service_name) AS all_service_names,
+            GROUP_CONCAT(DISTINCT bs.bs_tags) AS all_service_tags,
+            GROUP_CONCAT(DISTINCT t.tag_name) AS all_custom_tags
+        FROM business b
+        LEFT JOIN business_services bs ON bs.bs_business_id = b.business_uid
+        LEFT JOIN business_tags bt ON bt.bt_business_id = b.business_uid
+        LEFT JOIN tags t ON t.tag_uid = bt.bt_tag_id
+        WHERE b.business_is_active = 1
+        GROUP BY b.business_uid
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        row["business_latitude"] = safe_float(row.get("business_latitude"))
+        row["business_longitude"] = safe_float(row.get("business_longitude"))
+        row["business_google_rating"] = safe_float(row.get("business_google_rating"))
+        row["bs_service_names"] = csv_to_tokens(row.get("all_service_names"))
+        row["bs_tags"] = csv_to_tokens(row.get("all_service_tags"))
+        row["custom_tags"] = csv_to_tokens(row.get("all_custom_tags"))
+        row["score"] = 1.0
+        row["score_breakdown"] = {"browse_mode": True, "final_score": 1.0}
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            row.get("business_latitude"),
+            row.get("business_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            row["distance_miles"] = dist
+
+        rating = safe_float(row.get("business_google_rating"))
+        if rating is not None:
+            if min_rating is not None and rating < min_rating:
+                continue
+            if max_rating is not None and rating > max_rating:
+                continue
+
+        results.append(row)
+    return results
+
+
+def fetch_browse_expertise(user_lat, user_lon, max_distance):
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute(
+        """
+        SELECT profile_expertise.*,
+               user_email_id,
+               profile_personal_first_name, profile_personal_last_name,
+               profile_personal_email_is_public, profile_personal_phone_number,
+               profile_personal_phone_number_is_public,
+               profile_personal_city, profile_personal_state, profile_personal_country,
+               profile_personal_location_is_public,
+               profile_personal_latitude, profile_personal_longitude,
+               profile_personal_image, profile_personal_image_is_public,
+               profile_personal_tag_line, profile_personal_tag_line_is_public
+        FROM profile_expertise
+        LEFT JOIN every_circle.profile_personal
+            ON profile_personal_uid = profile_expertise_profile_personal_id
+        LEFT JOIN every_circle.users
+            ON user_uid = profile_personal_user_id
+        WHERE profile_expertise.profile_expertise_is_public = 1
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
+        row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+        row["score"] = 1.0
+        row["score_breakdown"] = {"browse_mode": True, "final_score": 1.0}
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            row.get("profile_personal_latitude"),
+            row.get("profile_personal_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            row["distance_miles"] = dist
+
+        results.append(row)
+    return results
+
+
+def fetch_browse_wishes(user_lat, user_lon, max_distance):
+    conn = mysql_connect()
+    cur = conn.cursor(pymysql.cursors.DictCursor)
+    cur.execute(
+        """
+        SELECT profile_wish.*,
+               user_email_id,
+               profile_personal_first_name, profile_personal_last_name,
+               profile_personal_email_is_public, profile_personal_phone_number,
+               profile_personal_phone_number_is_public,
+               profile_personal_city, profile_personal_state, profile_personal_country,
+               profile_personal_location_is_public,
+               profile_personal_latitude, profile_personal_longitude,
+               profile_personal_image, profile_personal_image_is_public,
+               profile_personal_tag_line, profile_personal_tag_line_is_public
+        FROM profile_wish
+        LEFT JOIN every_circle.profile_personal
+            ON profile_personal_uid = profile_wish_profile_personal_id
+        LEFT JOIN every_circle.users
+            ON user_uid = profile_personal_user_id
+        WHERE profile_wish.profile_wish_is_public = 1
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    results = []
+    for row in rows:
+        row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
+        row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+        row["score"] = 1.0
+        row["score_breakdown"] = {"browse_mode": True, "final_score": 1.0}
+
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            row.get("profile_personal_latitude"),
+            row.get("profile_personal_longitude"),
+        )
+        if not include:
+            continue
+        if dist is not None:
+            row["distance_miles"] = dist
+
+        results.append(row)
+    return results
+
+
 # ---------------------------------------------------------
 # EMBEDDING + MYSQL HELPERS
 # ---------------------------------------------------------
@@ -905,7 +1063,7 @@ def search_business():
     global biz_map
     biz_map = sync_businesses(biz_map)
 
-    query = request.args.get("q", "")
+    query = (request.args.get("q", "") or "").strip()
     limit_param = request.args.get("limit")
 
     # FILTER PARAMETERS (safe)
@@ -917,6 +1075,19 @@ def search_business():
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
+
+    if is_browse_query(query):
+        filtered = fetch_browse_businesses(user_lat, user_lon, max_distance, min_rating, max_rating)
+        for merged in filtered:
+            apply_home_proximity_boost(
+                merged,
+                user_lat,
+                user_lon,
+                max_distance,
+                "business_latitude",
+                "business_longitude",
+            )
+        return jsonify(filtered[:final_limit])
 
     vector = embed_text(query)
 
@@ -1150,7 +1321,7 @@ def search_wishes():
     global wish_map
     wish_map = sync_wishes(wish_map)
 
-    query = request.args.get("q", "")
+    query = (request.args.get("q", "") or "").strip()
     limit_param = request.args.get("limit")
     user_lat = safe_float(request.args.get("user_lat"))
     user_lon = safe_float(request.args.get("user_lon"))
@@ -1158,6 +1329,10 @@ def search_wishes():
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
+
+    if is_browse_query(query):
+        response = fetch_browse_wishes(user_lat, user_lon, max_distance)
+        return jsonify(response[:final_limit])
 
     vector = embed_text(query)
 
@@ -1379,7 +1554,7 @@ def search_expertise():
     global exp_map
     exp_map = sync_expertise(exp_map)
 
-    query = request.args.get("q", "")
+    query = (request.args.get("q", "") or "").strip()
     limit_param = request.args.get("limit")
     user_lat = safe_float(request.args.get("user_lat"))
     user_lon = safe_float(request.args.get("user_lon"))
@@ -1387,6 +1562,10 @@ def search_expertise():
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
+
+    if is_browse_query(query):
+        response = fetch_browse_expertise(user_lat, user_lon, max_distance)
+        return jsonify(response[:final_limit])
 
     vector = embed_text(query)
 
@@ -1476,7 +1655,7 @@ def search_global():
     biz_map = sync_businesses(biz_map)
     exp_map = sync_expertise(exp_map)
 
-    query = request.args.get("q", "")
+    query = (request.args.get("q", "") or "").strip()
     limit_param = request.args.get("limit")
     user_lat = safe_float(request.args.get("user_lat"))
     user_lon = safe_float(request.args.get("user_lon"))
@@ -1486,6 +1665,23 @@ def search_global():
 
     max_results = 99999
     final_limit = get_limit(limit_param, max_results)
+
+    if is_browse_query(query):
+        business_results = [{**row, "itemType": "businesses"} for row in fetch_browse_businesses(user_lat, user_lon, max_distance, min_rating, max_rating)]
+        for item in business_results:
+            apply_home_proximity_boost(
+                item,
+                user_lat,
+                user_lon,
+                max_distance,
+                "business_latitude",
+                "business_longitude",
+            )
+        expertise_results = [{**row, "itemType": "expertise"} for row in fetch_browse_expertise(user_lat, user_lon, max_distance)]
+        seeking_results = [{**row, "itemType": "seeking"} for row in fetch_browse_wishes(user_lat, user_lon, max_distance)]
+        combined = business_results + expertise_results + seeking_results
+        return jsonify(combined[:final_limit])
+
     vector = embed_text(query)
 
     # --- businesses ---
