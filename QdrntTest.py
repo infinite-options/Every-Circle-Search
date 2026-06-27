@@ -488,6 +488,17 @@ def _coords_usable(lat, lon):
     return True
 
 
+def expertise_effective_coords(row):
+    """Use offering address coords when set; otherwise seller home coords."""
+    lat = safe_float(row.get("profile_expertise_latitude"))
+    lon = safe_float(row.get("profile_expertise_longitude"))
+    if _coords_usable(lat, lon):
+        return lat, lon
+    return safe_float(row.get("profile_personal_latitude")), safe_float(
+        row.get("profile_personal_longitude")
+    )
+
+
 def distance_filter_passes(user_lat, user_lon, max_distance, target_lat, target_lon):
     """
     Returns (include_row, distance_miles).
@@ -632,15 +643,18 @@ def fetch_browse_expertise(user_lat, user_lon, max_distance):
     for row in rows:
         row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
         row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+        row["profile_expertise_latitude"] = safe_float(row.get("profile_expertise_latitude"))
+        row["profile_expertise_longitude"] = safe_float(row.get("profile_expertise_longitude"))
         row["score"] = 1.0
         row["score_breakdown"] = {"browse_mode": True, "final_score": 1.0}
 
+        exp_lat, exp_lon = expertise_effective_coords(row)
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
             max_distance,
-            row.get("profile_personal_latitude"),
-            row.get("profile_personal_longitude"),
+            exp_lat,
+            exp_lon,
         )
         if not include:
             continue
@@ -1609,6 +1623,8 @@ def search_expertise():
             # sanitize numeric fields
             row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
             row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+            row["profile_expertise_latitude"] = safe_float(row.get("profile_expertise_latitude"))
+            row["profile_expertise_longitude"] = safe_float(row.get("profile_expertise_longitude"))
 
             additional_info[row["profile_expertise_uid"]] = row
 
@@ -1628,12 +1644,13 @@ def search_expertise():
 
     response = []
     for obj in boosted_candidates:
+        exp_lat, exp_lon = expertise_effective_coords(obj)
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
             max_distance,
-            obj.get("profile_personal_latitude"),
-            obj.get("profile_personal_longitude"),
+            exp_lat,
+            exp_lon,
         )
         if not include:
             continue
@@ -1791,6 +1808,8 @@ def search_global():
         for row in rows:
             row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
             row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+            row["profile_expertise_latitude"] = safe_float(row.get("profile_expertise_latitude"))
+            row["profile_expertise_longitude"] = safe_float(row.get("profile_expertise_longitude"))
             exp_rows[row["profile_expertise_uid"]] = row
 
     merged_expertise_results = []
@@ -1807,12 +1826,13 @@ def search_global():
             merged.update(exp_rows[uid])
             merged["_sem_score"] = safe_float(r.score) or 0.0
 
+        exp_lat, exp_lon = expertise_effective_coords(merged)
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
             max_distance,
-            merged.get("profile_personal_latitude"),
-            merged.get("profile_personal_longitude"),
+            exp_lat,
+            exp_lon,
         )
         if not include:
             continue
