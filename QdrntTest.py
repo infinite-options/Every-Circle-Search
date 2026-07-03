@@ -87,6 +87,7 @@ RELATIVE_SCORE_FACTOR = _env_float("RELATIVE_SCORE_FACTOR", 0.60)
 LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
+GLOBAL_SEEKING_WEIGHT = _env_float("GLOBAL_SEEKING_WEIGHT", 0.85)
 SEARCH_DEFAULT_LIMIT = int(_env_float("SEARCH_DEFAULT_LIMIT", 120))
 # Soft proximity boost when user home coords are sent but no distance filter is active.
 PROXIMITY_BOOST_MILES = _env_float("PROXIMITY_BOOST_MILES", 5.0)
@@ -499,6 +500,17 @@ def expertise_effective_coords(row):
     )
 
 
+def wish_effective_coords(row):
+    """Use seeking address coords when set; otherwise seeker home coords."""
+    lat = safe_float(row.get("profile_wish_latitude"))
+    lon = safe_float(row.get("profile_wish_longitude"))
+    if _coords_usable(lat, lon):
+        return lat, lon
+    return safe_float(row.get("profile_personal_latitude")), safe_float(
+        row.get("profile_personal_longitude")
+    )
+
+
 def distance_filter_passes(user_lat, user_lon, max_distance, target_lat, target_lon):
     """
     Returns (include_row, distance_miles).
@@ -695,15 +707,18 @@ def fetch_browse_wishes(user_lat, user_lon, max_distance):
     for row in rows:
         row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
         row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+        row["profile_wish_latitude"] = safe_float(row.get("profile_wish_latitude"))
+        row["profile_wish_longitude"] = safe_float(row.get("profile_wish_longitude"))
         row["score"] = 1.0
         row["score_breakdown"] = {"browse_mode": True, "final_score": 1.0}
 
+        wish_lat, wish_lon = wish_effective_coords(row)
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
             max_distance,
-            row.get("profile_personal_latitude"),
-            row.get("profile_personal_longitude"),
+            wish_lat,
+            wish_lon,
         )
         if not include:
             continue
@@ -1391,6 +1406,8 @@ def search_wishes():
             # sanitize location numeric fields
             row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
             row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+            row["profile_wish_latitude"] = safe_float(row.get("profile_wish_latitude"))
+            row["profile_wish_longitude"] = safe_float(row.get("profile_wish_longitude"))
 
             additional_info[row["profile_wish_uid"]] = row
 
@@ -1410,12 +1427,13 @@ def search_wishes():
 
     response = []
     for obj in boosted_candidates:
+        wish_lat, wish_lon = wish_effective_coords(obj)
         include, dist = distance_filter_passes(
             user_lat,
             user_lon,
             max_distance,
-            obj.get("profile_personal_latitude"),
-            obj.get("profile_personal_longitude"),
+            wish_lat,
+            wish_lon,
         )
         if not include:
             continue
@@ -1664,13 +1682,14 @@ def search_expertise():
 
 
 # ---------------------------------------------------------
-# SEARCH GLOBAL (business + expertise only)
+# SEARCH GLOBAL (business + expertise + seeking)
 # ---------------------------------------------------------
 @app.route("/search_global", methods=["GET"])
 def search_global():
-    global biz_map, exp_map
+    global biz_map, exp_map, wish_map
     biz_map = sync_businesses(biz_map)
     exp_map = sync_expertise(exp_map)
+    wish_map = sync_wishes(wish_map)
 
     query = (request.args.get("q", "") or "").strip()
     limit_param = request.args.get("limit")
@@ -1844,15 +1863,88 @@ def search_global():
     apply_expertise_rescore(query, merged_expertise_results)
     expertise_results = filter_rescored_candidates(merged_expertise_results)
 
-    # Global ranking: prefer business intent by default, but keep expertise when truly relevant.
+    # --- seeking (wishes) ---
+    wish_hits = qdrant_vector_search("wishes", query_vector=vector, limit=max_results)
+    wish_uids = [r.payload.get("profile_wish_uid") for r in wish_hits]
+    wish_rows = {}
+    if wish_uids:
+        conn = mysql_connect()
+        cur = conn.cursor(pymysql.cursors.DictCursor)
+        placeholders = ",".join(["%s"] * len(wish_uids))
+        cur.execute(
+            f"""
+            SELECT profile_wish.*,
+                   user_email_id,
+                   profile_personal_first_name, profile_personal_last_name,
+                   profile_personal_email_is_public, profile_personal_phone_number,
+                   profile_personal_phone_number_is_public,
+                   profile_personal_city, profile_personal_state, profile_personal_country,
+                   profile_personal_location_is_public,
+                   profile_personal_latitude, profile_personal_longitude,
+                   profile_personal_image, profile_personal_image_is_public,
+                   profile_personal_tag_line, profile_personal_tag_line_is_public
+            FROM profile_wish
+            LEFT JOIN every_circle.profile_personal
+                ON profile_personal_uid = profile_wish_profile_personal_id
+            LEFT JOIN every_circle.users
+                ON user_uid = profile_personal_user_id
+            WHERE profile_wish_uid IN ({placeholders})
+              AND profile_wish_is_public = 1
+        """,
+            wish_uids,
+        )
+        rows = cur.fetchall()
+        conn.close()
+        for row in rows:
+            row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
+            row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
+            row["profile_wish_latitude"] = safe_float(row.get("profile_wish_latitude"))
+            row["profile_wish_longitude"] = safe_float(row.get("profile_wish_longitude"))
+            wish_rows[row["profile_wish_uid"]] = row
+
+    merged_seeking_results = []
+    for r in wish_hits:
+        uid = r.payload.get("profile_wish_uid")
+        if wish_uids and uid not in wish_rows:
+            continue
+        merged = {
+            "itemType": "seeking",
+            **r.payload,
+            "_sem_score": safe_float(r.score) or 0.0,
+        }
+        if uid in wish_rows:
+            merged.update(wish_rows[uid])
+            merged["_sem_score"] = safe_float(r.score) or 0.0
+
+        wish_lat, wish_lon = wish_effective_coords(merged)
+        include, dist = distance_filter_passes(
+            user_lat,
+            user_lon,
+            max_distance,
+            wish_lat,
+            wish_lon,
+        )
+        if not include:
+            continue
+        if dist is not None:
+            merged["distance_miles"] = dist
+
+        merged_seeking_results.append(merged)
+
+    apply_wish_rescore(query, merged_seeking_results)
+    seeking_results = filter_rescored_candidates(merged_seeking_results)
+
     for item in business_results:
         base = safe_float(item.get("score")) or 0.0
         item["global_score"] = base * GLOBAL_BUSINESS_WEIGHT
     for item in expertise_results:
         base = safe_float(item.get("score")) or 0.0
         item["global_score"] = base * GLOBAL_EXPERTISE_WEIGHT
+    for item in seeking_results:
+        base = safe_float(item.get("score")) or 0.0
+        item["global_score"] = base * GLOBAL_SEEKING_WEIGHT
 
-    combined = business_results + expertise_results
+    combined = business_results + expertise_results + seeking_results
     combined.sort(key=lambda x: safe_float(x.get("global_score")) or 0.0, reverse=True)
     return jsonify(combined[:final_limit])
 
