@@ -82,9 +82,12 @@ def _env_float(name, default):
         return default
 
 
-MIN_SIMILARITY_SCORE = _env_float("MIN_SIMILARITY_SCORE", 0.25)
-RELATIVE_SCORE_FACTOR = _env_float("RELATIVE_SCORE_FACTOR", 0.60)
+MIN_SIMILARITY_SCORE = _env_float("MIN_SIMILARITY_SCORE", 0.35)
+RELATIVE_SCORE_FACTOR = _env_float("RELATIVE_SCORE_FACTOR", 0.70)
 LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
+# Display cutoff uses raw hybrid channels (not RRF rank score). Pass if EITHER is strong.
+SEMANTIC_PASS_MIN = _env_float("SEMANTIC_PASS_MIN", 0.38)
+LEXICAL_PASS_MIN = _env_float("LEXICAL_PASS_MIN", 0.35)
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
 GLOBAL_SEEKING_WEIGHT = _env_float("GLOBAL_SEEKING_WEIGHT", 0.85)
@@ -98,33 +101,57 @@ RESCORE_MODE = (os.getenv("RESCORE_MODE") or "rrf").strip().lower()
 RRF_K = _env_float("RRF_K", 60.0)
 
 
+def _hit_channel_scores(hit):
+    """Return (semantic_score, lexical_fuzzy_score) from score_breakdown when present."""
+    payload = getattr(hit, "payload", None)
+    if not isinstance(payload, dict):
+        return None, None
+    breakdown = payload.get("score_breakdown") or {}
+    if not isinstance(breakdown, dict):
+        return None, None
+    return safe_float(breakdown.get("semantic_score")), safe_float(breakdown.get("lexical_fuzzy_score"))
+
+
+def hit_passes_channel_cutoff(hit):
+    """
+    Strong match if semantic OR lexical clears its floor.
+    Falls back to final/RRF score thresholds only when channel scores are missing.
+    """
+    sem, lex = _hit_channel_scores(hit)
+    if sem is not None or lex is not None:
+        return (sem is not None and sem >= SEMANTIC_PASS_MIN) or (lex is not None and lex >= LEXICAL_PASS_MIN)
+
+    score = safe_float(getattr(hit, "score", None)) or 0.0
+    return score >= MIN_SIMILARITY_SCORE
+
+
 def filter_relevant_hits(hits):
     """
-    Trim low-relevance tail results to reduce irrelevant matches.
-    Keeps hits that satisfy BOTH:
-      1) absolute minimum score
-      2) relative score vs top hit in the same result set
+    Annotate each hit with passes_relevance_cutoff (keep full list for "Show more").
+
+    Default UI keeps hits with a good semantic_score OR lexical_fuzzy_score.
+    RRF final_score is still used for ranking, not as the primary gate.
+    If none pass, the single best hit is marked so the default UI is not empty.
     """
     if not hits:
         return []
 
-    absolute_min = MIN_SIMILARITY_SCORE
-    relative_factor = RELATIVE_SCORE_FACTOR
-
-    top_score = max([(safe_float(getattr(h, "score", None)) or 0.0) for h in hits] + [0.0])
-    relative_min = top_score * relative_factor
-
-    filtered = []
     for hit in hits:
-        score = safe_float(getattr(hit, "score", None)) or 0.0
-        if score >= absolute_min and score >= relative_min:
-            filtered.append(hit)
+        passes = hit_passes_channel_cutoff(hit)
+        payload = getattr(hit, "payload", None)
+        if isinstance(payload, dict):
+            payload["passes_relevance_cutoff"] = passes
 
-    # Never return empty just because thresholds were too strict; keep best hit.
-    if not filtered and hits:
-        return hits[:1]
+    any_pass = any(
+        isinstance(getattr(h, "payload", None), dict) and h.payload.get("passes_relevance_cutoff") for h in hits
+    )
+    if not any_pass and hits:
+        best = max(hits, key=lambda h: safe_float(getattr(h, "score", None)) or 0.0)
+        payload = getattr(best, "payload", None)
+        if isinstance(payload, dict):
+            payload["passes_relevance_cutoff"] = True
 
-    return filtered
+    return hits
 
 
 def normalize_tokens(text):
