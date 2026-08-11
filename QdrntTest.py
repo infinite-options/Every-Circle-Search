@@ -415,6 +415,28 @@ def wish_lexical_score(query, row):
 # ---------------------------------------------------------
 # SAFE CONVERSION HELPERS (bulletproof)
 # ---------------------------------------------------------
+
+def owner_profile_is_publicly_visible(row):
+    """Hide content whose owner profile is taken down / pending review / acknowledged."""
+    if not row:
+        return True
+    try:
+        moderated = int(row.get("profile_personal_moderated") or 0)
+    except (TypeError, ValueError):
+        moderated = 0
+    return moderated == 0
+
+
+def content_row_is_publicly_visible(row, content_moderated_key):
+    if not owner_profile_is_publicly_visible(row):
+        return False
+    try:
+        moderated = int(row.get(content_moderated_key) or 0)
+    except (TypeError, ValueError):
+        moderated = 0
+    return moderated == 0
+
+
 def safe_float(value):
     """
     Safely convert value to float.
@@ -666,13 +688,16 @@ def fetch_browse_expertise(user_lat, user_lon, max_distance):
                profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
                profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public
+               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
         FROM profile_expertise
         LEFT JOIN every_circle.profile_personal
             ON profile_personal_uid = profile_expertise_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
         WHERE profile_expertise.profile_expertise_is_public = 1
+          AND COALESCE(profile_expertise.profile_expertise_moderated, 0) = 0
+          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
         """
     )
     rows = cur.fetchall()
@@ -718,13 +743,16 @@ def fetch_browse_wishes(user_lat, user_lon, max_distance):
                profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
                profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public
+               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
         FROM profile_wish
         LEFT JOIN every_circle.profile_personal
             ON profile_personal_uid = profile_wish_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
         WHERE profile_wish.profile_wish_is_public = 1
+          AND COALESCE(profile_wish.profile_wish_moderated, 0) = 0
+          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
         """
     )
     rows = cur.fetchall()
@@ -1272,6 +1300,7 @@ def sync_wishes(wish_map):
         SELECT {", ".join(wish_select_fields)}
         FROM profile_wish
         WHERE profile_wish_is_public = 1
+          AND COALESCE(profile_wish_moderated, 0) = 0
         """
     )
     rows = cur.fetchall()
@@ -1348,19 +1377,24 @@ def search_wishes_lexical():
                profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
                profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public
+               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
         FROM profile_wish
         LEFT JOIN every_circle.profile_personal
             ON profile_personal_uid = profile_wish_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
         WHERE profile_wish.profile_wish_is_public = 1
+          AND COALESCE(profile_wish.profile_wish_moderated, 0) = 0
+          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
     """)
     rows = cur.fetchall()
     conn.close()
 
     ranked = []
     for row in rows:
+        if not content_row_is_publicly_visible(row, "profile_wish_moderated"):
+            continue
         row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
         row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
         row["score"] = wish_lexical_score(query, row)
@@ -1414,13 +1448,16 @@ def search_wishes():
                    profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public
+                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
             FROM profile_wish
             LEFT JOIN every_circle.profile_personal
                 ON profile_personal_uid = profile_wish_profile_personal_id
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_wish_uid IN ({placeholders})
+              AND COALESCE(profile_wish_moderated, 0) = 0
+              AND COALESCE(profile_personal_moderated, 0) = 0
               AND profile_wish_is_public = 1
         """,
             wish_uids,
@@ -1508,6 +1545,7 @@ def sync_expertise(exp_map):
         SELECT {", ".join(exp_select_fields)}
         FROM profile_expertise
         WHERE profile_expertise_is_public = 1
+          AND COALESCE(profile_expertise_moderated, 0) = 0
         """
     )
     rows = cur.fetchall()
@@ -1584,19 +1622,24 @@ def search_expertise_lexical():
                profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
                profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public
+               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
         FROM profile_expertise
         LEFT JOIN every_circle.profile_personal
             ON profile_personal_uid = profile_expertise_profile_personal_id
         LEFT JOIN every_circle.users
             ON user_uid = profile_personal_user_id
         WHERE profile_expertise.profile_expertise_is_public = 1
+          AND COALESCE(profile_expertise.profile_expertise_moderated, 0) = 0
+          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
     """)
     rows = cur.fetchall()
     conn.close()
 
     ranked = []
     for row in rows:
+        if not content_row_is_publicly_visible(row, "profile_expertise_moderated"):
+            continue
         row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
         row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
         row["score"] = expertise_lexical_score(query, row)
@@ -1649,13 +1692,16 @@ def search_expertise():
                    profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public
+                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
             FROM profile_expertise
             LEFT JOIN every_circle.profile_personal
                 ON profile_personal_uid = profile_expertise_profile_personal_id
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_expertise_uid IN ({placeholders})
+              AND COALESCE(profile_expertise_moderated, 0) = 0
+              AND COALESCE(profile_personal_moderated, 0) = 0
               AND profile_expertise_is_public = 1
         """,
             exp_uids,
@@ -1838,13 +1884,16 @@ def search_global():
                    profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public
+                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
             FROM profile_expertise
             LEFT JOIN every_circle.profile_personal
                 ON profile_personal_uid = profile_expertise_profile_personal_id
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_expertise_uid IN ({placeholders})
+              AND COALESCE(profile_expertise_moderated, 0) = 0
+              AND COALESCE(profile_personal_moderated, 0) = 0
               AND profile_expertise_is_public = 1
         """,
             exp_uids,
@@ -1909,13 +1958,16 @@ def search_global():
                    profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
                    profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public
+                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_moderated
             FROM profile_wish
             LEFT JOIN every_circle.profile_personal
                 ON profile_personal_uid = profile_wish_profile_personal_id
             LEFT JOIN every_circle.users
                 ON user_uid = profile_personal_user_id
             WHERE profile_wish_uid IN ({placeholders})
+              AND COALESCE(profile_wish_moderated, 0) = 0
+              AND COALESCE(profile_personal_moderated, 0) = 0
               AND profile_wish_is_public = 1
         """,
             wish_uids,
