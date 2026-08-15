@@ -66,6 +66,7 @@ python-dotenv==1.0.0
 pytz==2024.2
 PyYAML==6.0.2
 qdrant-client==1.15.1
+fastembed>=0.7.0
 RapidFuzz==3.12.2
 regex==2024.11.6
 requests==2.31.0

@@ -38,6 +38,7 @@ PyMySQL==1.1.2
 python-dotenv==1.2.2
 PyYAML==6.0.3
 qdrant-client==1.17.1
+fastembed>=0.7.0
 RapidFuzz==3.14.5
 regex==2026.4.4
 rich==15.0.0

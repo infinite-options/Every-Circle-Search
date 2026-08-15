@@ -4,11 +4,20 @@ import uuid
 import math
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from thefuzz import fuzz
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
+from qdrant_client.models import (
+    Distance,
+    Document,
+    Modifier,
+    PointStruct,
+    Prefetch,
+    Rrf,
+    RrfQuery,
+    SparseVectorParams,
+    VectorParams,
+)
 
 # ---------------------------------------------------------
 # Environment Setup
@@ -30,6 +39,11 @@ EMBED_DIM = 384
 QDRANT_HOST = os.getenv("QDRANT_HOST", "127.0.0.1")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
 
+DENSE_VECTOR_NAME = "dense"
+BM25_VECTOR_NAME = "bm25"
+BM25_MODEL = "Qdrant/bm25"
+COLLECTION_NAMES = ("businesses", "wishes", "expertise")
+
 # CUDA can be advertised as available yet fail at runtime ("no kernel image for device")
 # when the PyTorch CUDA build does not match the GPU/driver. Default to CPU; set
 # SEARCH_EMBEDDING_DEVICE=cuda on hosts where GPU + torch are known good.
@@ -42,34 +56,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 embedder = SentenceTransformer(MODEL_NAME, device=SEARCH_EMBEDDING_DEVICE)
 qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-
-def qdrant_vector_search(collection_name, query_vector, limit):
-    """
-    Compatibility wrapper across qdrant-client versions.
-    Older versions expose `search`, newer versions expose `query_points`.
-    Returns a list of scored points in both cases.
-    """
-    if hasattr(qdrant, "search"):
-        return qdrant.search(
-            collection_name=collection_name,
-            query_vector=query_vector,
-            limit=limit,
-        )
-
-    if hasattr(qdrant, "query_points"):
-        response = qdrant.query_points(
-            collection_name=collection_name,
-            query=query_vector,
-            limit=limit,
-        )
-        points = getattr(response, "points", None)
-        if points is not None:
-            return points
-        if isinstance(response, dict):
-            return response.get("points", [])
-        return []
-
-    raise AttributeError("Qdrant client does not support vector search methods (search/query_points)")
+# In-memory sync fingerprints (uid -> version). Reset when hybrid collections are recreated.
+biz_map = {}
+wish_map = {}
+exp_map = {}
 
 
 def _env_float(name, default):
@@ -83,11 +73,10 @@ def _env_float(name, default):
 
 
 MIN_SIMILARITY_SCORE = _env_float("MIN_SIMILARITY_SCORE", 0.35)
-RELATIVE_SCORE_FACTOR = _env_float("RELATIVE_SCORE_FACTOR", 0.70)
-LEXICAL_MIN_SCORE = _env_float("LEXICAL_MIN_SCORE", 0.30)
-# Display cutoff uses raw hybrid channels (not RRF rank score). Pass if EITHER is strong.
-SEMANTIC_PASS_MIN = _env_float("SEMANTIC_PASS_MIN", 0.38)
-LEXICAL_PASS_MIN = _env_float("LEXICAL_PASS_MIN", 0.35)
+# Qdrant RRF uses k=60 by default; used only to normalize fused scores to ~[0, 1].
+RRF_K = _env_float("RRF_K", 60.0)
+HYBRID_TOP_K = int(_env_float("HYBRID_TOP_K", 100))
+HYBRID_TOP_K_MAX = int(_env_float("HYBRID_TOP_K_MAX", 500))
 GLOBAL_BUSINESS_WEIGHT = _env_float("GLOBAL_BUSINESS_WEIGHT", 1.15)
 GLOBAL_EXPERTISE_WEIGHT = _env_float("GLOBAL_EXPERTISE_WEIGHT", 0.85)
 GLOBAL_SEEKING_WEIGHT = _env_float("GLOBAL_SEEKING_WEIGHT", 0.85)
@@ -95,32 +84,80 @@ SEARCH_DEFAULT_LIMIT = int(_env_float("SEARCH_DEFAULT_LIMIT", 120))
 # Soft proximity boost when user home coords are sent but no distance filter is active.
 PROXIMITY_BOOST_MILES = _env_float("PROXIMITY_BOOST_MILES", 5.0)
 PROXIMITY_BOOST_FACTOR = _env_float("PROXIMITY_BOOST_FACTOR", 1.12)
+# Category + exact-match boost (mirrors SearchCompareDemo).
+SEMANTIC_CATEGORY_MIN = _env_float("SEMANTIC_CATEGORY_MIN", 0.4)
+EXACT_MATCH_MIN_TOKEN_LEN = int(os.getenv("EXACT_MATCH_MIN_TOKEN_LEN", "3"))
+CONTAINS_MATCH_MIN_TOKEN_LEN = int(os.getenv("CONTAINS_MATCH_MIN_TOKEN_LEN", "4"))
+EXACT_MATCH_BOOST_FACTOR = _env_float("EXACT_MATCH_BOOST_FACTOR", 1.20)
 
-# Business hybrid re-score: "rrf" = reciprocal rank fusion (semantic vs fuzzy-lexical); "legacy" = sem + token boost
-RESCORE_MODE = (os.getenv("RESCORE_MODE") or "rrf").strip().lower()
-RRF_K = _env_float("RRF_K", 60.0)
-
-
-def _hit_channel_scores(hit):
-    """Return (semantic_score, lexical_fuzzy_score) from score_breakdown when present."""
-    payload = getattr(hit, "payload", None)
-    if not isinstance(payload, dict):
-        return None, None
-    breakdown = payload.get("score_breakdown") or {}
-    if not isinstance(breakdown, dict):
-        return None, None
-    return safe_float(breakdown.get("semantic_score")), safe_float(breakdown.get("lexical_fuzzy_score"))
+SEARCH_CATEGORY_META = (
+    ("sparse", "Sparse (BM25)"),
+    ("exact", "Exact match"),
+    ("semantic", f"Semantic only (>{SEMANTIC_CATEGORY_MIN:g})"),
+    ("other", "Other"),
+)
 
 
-def hit_passes_channel_cutoff(hit):
+def hybrid_candidate_limit(final_limit):
+    """Bound Qdrant hybrid retrieval; never pull the full collection."""
+    target = max(int(final_limit or HYBRID_TOP_K), HYBRID_TOP_K)
+    return max(1, min(target, HYBRID_TOP_K_MAX))
+
+
+def normalize_rrf_score(raw_score):
+    """Normalize two-channel Qdrant RRF score into approximately [0, 1].
+
+    Must use the same k as qdrant_hybrid_search (RRF_K). FusionQuery(RRF) defaults
+    to k=2 on the server; we pass RRF_K explicitly so scores do not all clamp to 1.0.
     """
-    Strong match if semantic OR lexical clears its floor.
-    Falls back to final/RRF score thresholds only when channel scores are missing.
-    """
-    sem, lex = _hit_channel_scores(hit)
-    if sem is not None or lex is not None:
-        return (sem is not None and sem >= SEMANTIC_PASS_MIN) or (lex is not None and lex >= LEXICAL_PASS_MIN)
+    max_raw = (2.0 / (RRF_K + 1.0)) if RRF_K > 0 else 0.0
+    raw = safe_float(raw_score) or 0.0
+    if max_raw <= 0:
+        return 0.0
+    return min(1.0, raw / max_raw)
 
+
+def qdrant_hybrid_search(collection_name, query_text, query_vector, limit):
+    """
+    Dense + BM25 prefetch, fused with Qdrant native RRF.
+    Requires fastembed for local BM25 Document encoding.
+    """
+    rrf_k = max(1, int(RRF_K))
+    response = qdrant.query_points(
+        collection_name=collection_name,
+        prefetch=[
+            Prefetch(
+                query=query_vector,
+                using=DENSE_VECTOR_NAME,
+                limit=limit,
+            ),
+            Prefetch(
+                query=Document(text=query_text or "", model=BM25_MODEL),
+                using=BM25_VECTOR_NAME,
+                limit=limit,
+            ),
+        ],
+        query=RrfQuery(rrf=Rrf(k=rrf_k)),
+        limit=limit,
+        with_payload=True,
+    )
+    points = getattr(response, "points", None)
+    if points is not None:
+        return points
+    if isinstance(response, dict):
+        return response.get("points", [])
+    return []
+
+
+def build_point_vectors(text):
+    searchable = "" if text is None else str(text)
+    return {
+        DENSE_VECTOR_NAME: embed_text(searchable),
+        BM25_VECTOR_NAME: Document(text=searchable, model=BM25_MODEL),
+    }
+
+
+def hit_passes_relevance_cutoff(hit):
     score = safe_float(getattr(hit, "score", None)) or 0.0
     return score >= MIN_SIMILARITY_SCORE
 
@@ -128,16 +165,13 @@ def hit_passes_channel_cutoff(hit):
 def filter_relevant_hits(hits):
     """
     Annotate each hit with passes_relevance_cutoff (keep full list for "Show more").
-
-    Default UI keeps hits with a good semantic_score OR lexical_fuzzy_score.
-    RRF final_score is still used for ranking, not as the primary gate.
-    If none pass, the single best hit is marked so the default UI is not empty.
+    If none pass, mark the single best hit so the default UI is not empty.
     """
     if not hits:
         return []
 
     for hit in hits:
-        passes = hit_passes_channel_cutoff(hit)
+        passes = hit_passes_relevance_cutoff(hit)
         payload = getattr(hit, "payload", None)
         if isinstance(payload, dict):
             payload["passes_relevance_cutoff"] = passes
@@ -154,6 +188,60 @@ def filter_relevant_hits(hits):
     return hits
 
 
+def filter_rescored_candidates(merged_candidates):
+    class _Hit:
+        def __init__(self, payload):
+            self.payload = payload
+            self.score = payload.get("score", 0.0)
+
+    return [h.payload for h in filter_relevant_hits([_Hit(m) for m in merged_candidates])]
+
+
+def merge_hybrid_hits(results, uid_field, additional_info):
+    """Attach normalized Qdrant RRF scores and merge SQL enrichment rows."""
+    merged_candidates = []
+    for r in results:
+        payload = getattr(r, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        uid = payload.get(uid_field)
+        if additional_info is not None and (not uid or uid not in additional_info):
+            continue
+
+        raw = safe_float(getattr(r, "score", None)) or 0.0
+        norm = normalize_rrf_score(raw)
+        merged = {**payload}
+        if uid and additional_info and uid in additional_info:
+            merged.update(additional_info[uid])
+        merged["score"] = norm
+        merged["score_breakdown"] = {
+            "fusion": "rrf",
+            "rescore_mode": "qdrant_hybrid",
+            "rrf_raw": raw,
+            "final_score": norm,
+        }
+        merged_candidates.append(merged)
+
+    return filter_rescored_candidates(merged_candidates)
+
+
+def clamp01(value):
+    num = safe_float(value)
+    if num is None:
+        return None
+    return max(0.0, min(1.0, num))
+
+
+def minmax_norm_map(score_map):
+    if not score_map:
+        return {}
+    vals = list(score_map.values())
+    lo, hi = min(vals), max(vals)
+    if hi <= lo:
+        return {uid: 1.0 for uid in score_map}
+    return {uid: (val - lo) / (hi - lo) for uid, val in score_map.items()}
+
+
 def normalize_tokens(text):
     if text is None:
         return []
@@ -164,82 +252,199 @@ def normalize_tokens(text):
     return [t for t in cleaned.split() if t]
 
 
-def business_lexical_details(query, payload):
+def qdrant_named_search(collection_name, query, using, limit):
+    response = qdrant.query_points(
+        collection_name=collection_name,
+        query=query,
+        using=using,
+        limit=limit,
+        with_payload=True,
+    )
+    points = getattr(response, "points", None)
+    if points is not None:
+        return points
+    if isinstance(response, dict):
+        return response.get("points", [])
+    return []
+
+
+def scores_by_uid(hits, uid_field):
+    out = {}
+    for hit in hits:
+        payload = getattr(hit, "payload", None) or {}
+        if not isinstance(payload, dict):
+            continue
+        uid = payload.get(uid_field)
+        score = safe_float(getattr(hit, "score", None))
+        if uid and score is not None:
+            out[uid] = score
+    return out
+
+
+def row_match_text(row, uid_field):
+    """Same fields that get indexed: name/bio/tags for businesses, title+desc otherwise."""
+    if uid_field == "business_uid":
+        parts = [
+            row.get("business_name"),
+            row.get("business_short_bio"),
+            row.get("business_tag_line"),
+        ]
+        for key in ("tags", "bs_tags", "bs_service_names", "custom_tags"):
+            vals = row.get(key)
+            if isinstance(vals, list):
+                parts.extend(vals)
+            elif vals:
+                parts.append(vals)
+        return " ".join(str(p) for p in parts if p)
+    if uid_field == "profile_expertise_uid":
+        return " ".join(
+            str(p)
+            for p in (row.get("profile_expertise_title"), row.get("profile_expertise_description"))
+            if p
+        )
+    if uid_field == "profile_wish_uid":
+        return " ".join(
+            str(p) for p in (row.get("profile_wish_title"), row.get("profile_wish_description")) if p
+        )
+    return ""
+
+
+def detect_exact_match(query, row, uid_field):
     """
-    Return lexical contribution breakdown for business relevance.
+    Exact token match or containment: query 'games' matches 'GameStop'.
+    Kind is 'token' when any query token equals a document token, else 'contains'.
     """
+    empty = {
+        "has_exact_match": False,
+        "exact_match_kind": None,
+        "exact_match_tokens": [],
+        "exact_match_boost_factor": None,
+    }
     q_tokens = normalize_tokens(query)
-    if not q_tokens:
-        return {
-            "token_tag": 0.0,
-            "token_name": 0.0,
-            "token_tagline": 0.0,
-            "token_bio": 0.0,
-            "phrase_name": 0.0,
-            "phrase_tag": 0.0,
-            "total_lexical_boost": 0.0,
-        }
+    doc_tokens = normalize_tokens(row_match_text(row, uid_field))
+    if not q_tokens or not doc_tokens:
+        return empty
 
-    name_tokens = normalize_tokens(payload.get("business_name"))
-    bio_tokens = normalize_tokens(payload.get("business_short_bio"))
-    tag_line_tokens = normalize_tokens(payload.get("business_tag_line"))
-
-    tag_tokens = []
-    for t in payload.get("tags", []) or []:
-        tag_tokens.extend(normalize_tokens(t))
-    for t in payload.get("bs_tags", []) or []:
-        tag_tokens.extend(normalize_tokens(t))
-    for t in payload.get("bs_service_names", []) or []:
-        tag_tokens.extend(normalize_tokens(t))
-    for t in payload.get("custom_tags", []) or []:
-        tag_tokens.extend(normalize_tokens(t))
-
-    name_set = set(name_tokens)
-    bio_set = set(bio_tokens)
-    tag_line_set = set(tag_line_tokens)
-    tag_set = set(tag_tokens)
-
-    token_tag = 0.0
-    token_name = 0.0
-    token_tagline = 0.0
-    token_bio = 0.0
+    token_hits = []
+    contains_hits = []
     for q in q_tokens:
-        if q in tag_set:
-            token_tag += 0.22
-        if q in name_set:
-            token_name += 0.16
-        if q in tag_line_set:
-            token_tagline += 0.12
-        if q in bio_set:
-            token_bio += 0.06
+        if len(q) >= EXACT_MATCH_MIN_TOKEN_LEN and q in doc_tokens:
+            token_hits.append(q)
+            continue
+        if len(q) >= CONTAINS_MATCH_MIN_TOKEN_LEN and any(q in tok and q != tok for tok in doc_tokens):
+            contains_hits.append(q)
 
-    # Phrase-level tiny bonus when raw query appears in key text
-    phrase_name = 0.0
-    phrase_tag = 0.0
-    q_str = " ".join(q_tokens)
-    if q_str:
-        name_str = " ".join(name_tokens)
-        tag_str = " ".join(tag_tokens)
-        if q_str and q_str in name_str:
-            phrase_name += 0.08
-        if q_str and q_str in tag_str:
-            phrase_tag += 0.12
+    q_phrase = " ".join(q_tokens)
+    haystack = " ".join(doc_tokens)
+    if (
+        not token_hits
+        and not contains_hits
+        and len(q_phrase) >= CONTAINS_MATCH_MIN_TOKEN_LEN
+        and q_phrase in haystack
+    ):
+        contains_hits.append(q_phrase)
 
-    total = token_tag + token_name + token_tagline + token_bio + phrase_name + phrase_tag
+    matched = token_hits or contains_hits
+    if not matched:
+        return empty
     return {
-        "token_tag": token_tag,
-        "token_name": token_name,
-        "token_tagline": token_tagline,
-        "token_bio": token_bio,
-        "phrase_name": phrase_name,
-        "phrase_tag": phrase_tag,
-        "total_lexical_boost": total,
+        "has_exact_match": True,
+        "exact_match_kind": "token" if token_hits else "contains",
+        "exact_match_tokens": matched,
+        "exact_match_boost_factor": EXACT_MATCH_BOOST_FACTOR,
     }
 
 
-def business_lexical_boost(query, payload):
-    details = business_lexical_details(query, payload)
-    return details["total_lexical_boost"]
+def apply_exact_match_boost(rows, query, uid_field):
+    """Lift fused score after RRF; proximity may multiply this further."""
+    for row in rows:
+        details = detect_exact_match(query, row, uid_field)
+        breakdown = row.get("score_breakdown")
+        if not isinstance(breakdown, dict):
+            breakdown = {}
+            row["score_breakdown"] = breakdown
+        breakdown.update(details)
+        if not details["has_exact_match"]:
+            continue
+        base = safe_float(row.get("score")) or 0.0
+        boosted = base * EXACT_MATCH_BOOST_FACTOR
+        row["score"] = boosted
+        breakdown["score_before_exact_match"] = base
+        breakdown["final_score"] = boosted
+
+
+def annotate_hybrid_channels(rows, query, uid_field, collection_name, candidate_limit):
+    """
+    Attach dense/sparse channel flags for categorization, then exact-match boost.
+    Sparse membership comes from a BM25-only query; semantic_score from dense cosine.
+    """
+    if not rows:
+        return rows
+
+    vector = embed_text(query)
+    bm25_query = Document(text=query or "", model=BM25_MODEL)
+    dense_hits = qdrant_named_search(collection_name, vector, DENSE_VECTOR_NAME, candidate_limit)
+    sparse_hits = qdrant_named_search(collection_name, bm25_query, BM25_VECTOR_NAME, candidate_limit)
+    dense_map = scores_by_uid(dense_hits, uid_field)
+    sparse_map = scores_by_uid(sparse_hits, uid_field)
+    dense_norm = {uid: clamp01(score) for uid, score in dense_map.items()}
+    sparse_norm = minmax_norm_map(sparse_map)
+
+    for row in rows:
+        uid = row.get(uid_field)
+        breakdown = row.get("score_breakdown")
+        if not isinstance(breakdown, dict):
+            breakdown = {}
+            row["score_breakdown"] = breakdown
+        has_sparse = bool(uid and uid in sparse_map)
+        dense = dense_norm.get(uid) if uid else None
+        sparse = sparse_norm.get(uid) if uid else None
+        breakdown.update(
+            {
+                "has_sparse_score": has_sparse,
+                "dense_score_raw": dense_map.get(uid) if uid else None,
+                "sparse_score_raw": sparse_map.get(uid) if uid else None,
+                "dense_score": dense,
+                "sparse_score": sparse if has_sparse else None,
+                "semantic_score": dense,
+                "dense_sparse_score": clamp01(row.get("score")),
+            }
+        )
+
+    apply_exact_match_boost(rows, query, uid_field)
+    return rows
+
+
+def classify_search_result(row):
+    """Mutually exclusive buckets: sparse > exact > semantic > other."""
+    breakdown = row.get("score_breakdown") or {}
+    if breakdown.get("has_sparse_score"):
+        return "sparse"
+    if breakdown.get("has_exact_match"):
+        return "exact"
+    semantic = safe_float(breakdown.get("semantic_score"))
+    if semantic is not None and semantic > SEMANTIC_CATEGORY_MIN:
+        return "semantic"
+    return "other"
+
+
+def build_search_categories(rows):
+    """Annotate rows and return collapsible category metadata for the client."""
+    counts = {"sparse": 0, "exact": 0, "semantic": 0, "other": 0}
+    for row in rows:
+        category = classify_search_result(row)
+        row["search_result_category"] = category
+        row["passes_relevance_cutoff"] = True
+        counts[category] += 1
+    return [
+        {"id": cat_id, "title": title, "count": counts[cat_id]}
+        for cat_id, title in SEARCH_CATEGORY_META
+    ]
+
+
+def jsonify_categorized(rows):
+    categories = build_search_categories(rows)
+    return jsonify({"results": rows, "search_categories": categories})
 
 
 def csv_to_tokens(value):
@@ -253,164 +458,6 @@ def csv_to_tokens(value):
     parts = [p.strip().lower() for p in str(value).split(",") if p and p.strip()]
     return parts
 
-
-def fuzzy_norm(query, text):
-    if not query or not text:
-        return 0.0
-    return fuzz.token_set_ratio(str(query), str(text)) / 100.0
-
-
-def business_lexical_score(query, row):
-    name = row.get("business_name") or ""
-    tagline = row.get("business_tag_line") or ""
-    bio = row.get("business_short_bio") or ""
-    # SQL lexical path uses all_* keys; Qdrant payload uses bs_* / custom_tags.
-    service_names = csv_to_tokens(row.get("all_service_names") or row.get("bs_service_names"))
-    service_tags = csv_to_tokens(row.get("all_service_tags") or row.get("bs_tags"))
-    custom_tags = csv_to_tokens(row.get("all_custom_tags") or row.get("custom_tags"))
-
-    score = 0.0
-    score += 0.30 * fuzzy_norm(query, name)
-    score += 0.10 * fuzzy_norm(query, tagline)
-    score += 0.08 * fuzzy_norm(query, bio)
-    score += 0.22 * fuzzy_norm(query, " ".join(service_names))
-    score += 0.18 * fuzzy_norm(query, " ".join(service_tags))
-    score += 0.22 * fuzzy_norm(query, " ".join(custom_tags))
-
-    return min(1.0, score)
-
-
-def apply_hybrid_rescore(query, merged_candidates, lexical_score_fn, uid_field, lexical_details_fn=None):
-    """
-    Produce final `score` and `score_breakdown` via semantic + fuzzy-lexical hybrid re-score.
-
-    - rrf (default): reciprocal rank fusion of Qdrant semantic order and fuzzy lexical order.
-    - legacy: semantic cosine plus lexical boost (token details for business, scaled fuzzy for others).
-    """
-    if not merged_candidates:
-        return merged_candidates
-
-    if RESCORE_MODE == "legacy":
-        for merged in merged_candidates:
-            sem_score = safe_float(merged.pop("_sem_score", None))
-            if sem_score is None:
-                sem_score = safe_float(merged.get("score")) or 0.0
-            lex_score = lexical_score_fn(query, merged)
-            if lexical_details_fn:
-                lexical_details = lexical_details_fn(query, merged)
-                final_score = sem_score + lexical_details["total_lexical_boost"]
-            else:
-                lexical_details = {}
-                final_score = sem_score + lex_score * 0.25
-            merged["score"] = final_score
-            breakdown = {
-                "rescore_mode": "legacy",
-                "semantic_score": sem_score,
-                "lexical_fuzzy_score": lex_score,
-                "final_score": final_score,
-            }
-            if lexical_details:
-                breakdown.update(lexical_details)
-            merged["score_breakdown"] = breakdown
-        return merged_candidates
-
-    n = len(merged_candidates)
-    sem_scores = []
-    lex_scores = []
-    for merged in merged_candidates:
-        sem = safe_float(merged.pop("_sem_score", None))
-        if sem is None:
-            sem = safe_float(merged.get("score")) or 0.0
-        sem_scores.append(sem)
-        lex_scores.append(lexical_score_fn(query, merged))
-
-    uid_key = lambda i: str(merged_candidates[i].get(uid_field) or "")
-    sem_order = sorted(
-        range(n),
-        key=lambda i: (-(sem_scores[i] or 0.0), -(lex_scores[i] or 0.0), uid_key(i)),
-    )
-    lex_order = sorted(
-        range(n),
-        key=lambda i: (-(lex_scores[i] or 0.0), -(sem_scores[i] or 0.0), uid_key(i)),
-    )
-
-    rank_sem = [0] * n
-    rank_lex = [0] * n
-    for pos, i in enumerate(sem_order):
-        rank_sem[i] = pos + 1
-    for pos, i in enumerate(lex_order):
-        rank_lex[i] = pos + 1
-
-    k = RRF_K
-    max_raw = (2.0 / (k + 1.0)) if k > 0 else 0.0
-
-    for i, merged in enumerate(merged_candidates):
-        raw_rrf = (1.0 / (k + rank_sem[i])) + (1.0 / (k + rank_lex[i]))
-        norm_rrf = min(1.0, (raw_rrf / max_raw) if max_raw > 0 else 0.0)
-        extra = lexical_details_fn(query, merged) if lexical_details_fn else {}
-        merged["score"] = norm_rrf
-        merged["score_breakdown"] = {
-            "rescore_mode": "rrf",
-            "semantic_score": sem_scores[i],
-            "lexical_fuzzy_score": lex_scores[i],
-            **extra,
-            "rrf_k": k,
-            "rrf_rank_semantic": rank_sem[i],
-            "rrf_rank_lexical": rank_lex[i],
-            "rrf_raw": raw_rrf,
-            "final_score": norm_rrf,
-        }
-    return merged_candidates
-
-
-def apply_business_rescore(query, merged_candidates):
-    return apply_hybrid_rescore(
-        query,
-        merged_candidates,
-        business_lexical_score,
-        "business_uid",
-        business_lexical_details,
-    )
-
-
-def apply_expertise_rescore(query, merged_candidates):
-    return apply_hybrid_rescore(
-        query,
-        merged_candidates,
-        expertise_lexical_score,
-        "profile_expertise_uid",
-    )
-
-
-def apply_wish_rescore(query, merged_candidates):
-    return apply_hybrid_rescore(
-        query,
-        merged_candidates,
-        wish_lexical_score,
-        "profile_wish_uid",
-    )
-
-
-def filter_rescored_candidates(merged_candidates):
-    class _Hit:
-        def __init__(self, payload):
-            self.payload = payload
-            self.score = payload.get("score", 0.0)
-
-    return [h.payload for h in filter_relevant_hits([_Hit(m) for m in merged_candidates])]
-
-
-def expertise_lexical_score(query, row):
-    title = row.get("profile_expertise_title") or ""
-    desc = row.get("profile_expertise_description") or ""
-    details = row.get("profile_expertise_details") or ""
-    return min(1.0, 0.55 * fuzzy_norm(query, title) + 0.30 * fuzzy_norm(query, desc) + 0.15 * fuzzy_norm(query, details))
-
-
-def wish_lexical_score(query, row):
-    title = row.get("profile_wish_title") or ""
-    desc = row.get("profile_wish_description") or ""
-    return min(1.0, 0.60 * fuzzy_norm(query, title) + 0.40 * fuzzy_norm(query, desc))
 
 # ---------------------------------------------------------
 # SAFE CONVERSION HELPERS (bulletproof)
@@ -837,17 +884,74 @@ def pick_sync_timestamp_column(existing_columns, candidates):
 
 
 # ---------------------------------------------------------
-# ENSURE COLLECTIONS
+# ENSURE COLLECTIONS (dense + BM25 sparse)
 # ---------------------------------------------------------
+def collection_supports_hybrid(collection_name):
+    """True when collection has named dense + bm25 sparse vectors."""
+    try:
+        info = qdrant.get_collection(collection_name)
+        params = info.config.params
+        vectors = params.vectors
+        sparse = params.sparse_vectors
+        if not sparse or BM25_VECTOR_NAME not in sparse:
+            return False
+        if isinstance(vectors, dict):
+            return DENSE_VECTOR_NAME in vectors
+        return False
+    except Exception:
+        return False
+
+
+_hybrid_collections_verified = False
+
+
 def ensure_collections():
-    for col in ["businesses", "wishes", "expertise"]:
-        if not qdrant.collection_exists(col):
-            print(f"🆕 Creating Qdrant collection '{col}'...")
-            qdrant.create_collection(
-                collection_name=col,
-                vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
-            )
-        print(f"✅ Collection '{col}' ready.")
+    """
+    Ensure hybrid collections exist.
+    Returns True if any collection was created or recreated (caller should reset sync maps).
+    """
+    recreated = False
+    for col in COLLECTION_NAMES:
+        if qdrant.collection_exists(col):
+            if collection_supports_hybrid(col):
+                continue
+            print(f"♻️ Recreating Qdrant collection '{col}' for dense+bm25 hybrid...")
+            qdrant.delete_collection(col)
+            recreated = True
+
+        print(f"🆕 Creating Qdrant collection '{col}' (dense+bm25)...")
+        qdrant.create_collection(
+            collection_name=col,
+            vectors_config={
+                DENSE_VECTOR_NAME: VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            },
+            sparse_vectors_config={
+                BM25_VECTOR_NAME: SparseVectorParams(modifier=Modifier.IDF),
+            },
+        )
+        recreated = True
+        print(f"✅ Collection '{col}' ready (hybrid).")
+
+    if not recreated:
+        print("✅ Hybrid collections ready (dense+bm25).")
+    return recreated
+
+
+def reset_sync_maps():
+    global biz_map, wish_map, exp_map
+    biz_map = {}
+    wish_map = {}
+    exp_map = {}
+
+
+def prepare_search_indexes():
+    """Ensure hybrid schema once per process; clear sync maps after recreate."""
+    global _hybrid_collections_verified
+    if _hybrid_collections_verified:
+        return
+    if ensure_collections():
+        reset_sync_maps()
+    _hybrid_collections_verified = True
 
 
 # ---------------------------------------------------------
@@ -1072,7 +1176,7 @@ def upsert_business(row):
         points=[
             PointStruct(
                 id=make_uuid(uid),
-                vector=embed_text(text),
+                vector=build_point_vectors(text),
                 payload=payload
             )
         ]
@@ -1080,71 +1184,12 @@ def upsert_business(row):
 
 
 # ---------------------------------------------------------
-# SEARCH BUSINESS (FULLY FIXED)
+# SEARCH BUSINESS
 # ---------------------------------------------------------
-def search_business_lexical():
-    query = (request.args.get("q", "") or "").strip()
-    limit_param = request.args.get("limit")
-    user_lat = safe_float(request.args.get("user_lat"))
-    user_lon = safe_float(request.args.get("user_lon"))
-    max_distance = safe_float(request.args.get("max_distance"))
-    min_rating = safe_float(request.args.get("min_rating"))
-    max_rating = safe_float(request.args.get("max_rating"))
-    final_limit = get_limit(limit_param, 99999)
-
-    conn = mysql_connect()
-    cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("""
-        SELECT
-            b.*,
-            GROUP_CONCAT(DISTINCT bs.bs_service_name) AS all_service_names,
-            GROUP_CONCAT(DISTINCT bs.bs_tags) AS all_service_tags,
-            GROUP_CONCAT(DISTINCT t.tag_name) AS all_custom_tags
-        FROM business b
-        LEFT JOIN business_services bs ON bs.bs_business_id = b.business_uid
-        LEFT JOIN business_tags bt ON bt.bt_business_id = b.business_uid
-        LEFT JOIN tags t ON t.tag_uid = bt.bt_tag_id
-        WHERE b.business_is_active = 1
-        GROUP BY b.business_uid
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    ranked = []
-    for row in rows:
-        row["business_latitude"] = safe_float(row.get("business_latitude"))
-        row["business_longitude"] = safe_float(row.get("business_longitude"))
-        row["business_google_rating"] = safe_float(row.get("business_google_rating"))
-        row["score"] = business_lexical_score(query, row)
-        row["bs_service_names"] = csv_to_tokens(row.get("all_service_names"))
-        row["bs_tags"] = csv_to_tokens(row.get("all_service_tags"))
-        row["custom_tags"] = csv_to_tokens(row.get("all_custom_tags"))
-
-        if row["score"] < LEXICAL_MIN_SCORE:
-            continue
-
-        if user_lat is not None and user_lon is not None:
-            dist = haversine_miles(user_lat, user_lon, row.get("business_latitude"), row.get("business_longitude"))
-            row["distance_miles"] = dist
-            if max_distance is not None and dist is not None and dist > max_distance:
-                continue
-
-        rating = safe_float(row.get("business_google_rating"))
-        if rating is not None:
-            if min_rating is not None and rating < min_rating:
-                continue
-            if max_rating is not None and rating > max_rating:
-                continue
-
-        ranked.append(row)
-
-    ranked.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(ranked[:final_limit])
-
-
 @app.route("/search_business", methods=["GET"])
 def search_business():
     global biz_map
+    prepare_search_indexes()
     biz_map = sync_businesses(biz_map)
 
     query = (request.args.get("q", "") or "").strip()
@@ -1157,8 +1202,8 @@ def search_business():
     min_rating = safe_float(request.args.get("min_rating"))
     max_rating = safe_float(request.args.get("max_rating"))
 
-    max_results = 99999
-    final_limit = get_limit(limit_param, max_results)
+    final_limit = get_limit(limit_param, 99999)
+    candidate_limit = hybrid_candidate_limit(final_limit)
 
     if is_browse_query(query):
         filtered = fetch_browse_businesses(user_lat, user_lon, max_distance, min_rating, max_rating)
@@ -1171,14 +1216,12 @@ def search_business():
                 "business_latitude",
                 "business_longitude",
             )
-        return jsonify(filtered[:final_limit])
+        return jsonify_categorized(filtered[:final_limit])
 
     vector = embed_text(query)
+    results = qdrant_hybrid_search("businesses", query, vector, candidate_limit)
 
-    # search qdrant
-    results = qdrant_vector_search("businesses", query_vector=vector, limit=max_results)
-
-    business_uids = [r.payload.get("business_uid") for r in results]
+    business_uids = [r.payload.get("business_uid") for r in results if getattr(r, "payload", None)]
     additional_info = {}
 
     # fetch SQL details
@@ -1210,21 +1253,10 @@ def search_business():
 
             additional_info[row["business_uid"]] = row
 
-    # Build merged candidates; re-score (RRF or legacy) before relevance filtering.
-    merged_candidates = []
-    for r in results:
-        uid = r.payload.get("business_uid")
-        if business_uids and uid not in additional_info:
-            continue
-        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
-        if uid in additional_info:
-            merged.update(additional_info[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
-        merged_candidates.append(merged)
-
-    apply_business_rescore(query, merged_candidates)
-
-    boosted_candidates = filter_rescored_candidates(merged_candidates)
+    boosted_candidates = merge_hybrid_hits(results, "business_uid", additional_info)
+    annotate_hybrid_channels(
+        boosted_candidates, query, "business_uid", "businesses", candidate_limit
+    )
 
     # -----------------------------------------------------
     # APPLY FILTERS + ADD DISTANCE (SAFE)
@@ -1263,7 +1295,7 @@ def search_business():
         filtered.append(merged)
 
     filtered.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(filtered[:final_limit])
+    return jsonify_categorized(filtered[:final_limit])
 
 # ---------------------------------------------------------
 # WISHES SYNC
@@ -1350,7 +1382,7 @@ def upsert_wish(row):
         points=[
             PointStruct(
                 id=make_uuid(uid),
-                vector=embed_text(text),
+                vector=build_point_vectors(text),
                 payload=row
             )
         ]
@@ -1358,57 +1390,12 @@ def upsert_wish(row):
 
 
 # ---------------------------------------------------------
-# SEARCH WISHES (safe, but no numeric conversions needed)
+# SEARCH WISHES
 # ---------------------------------------------------------
-def search_wishes_lexical():
-    query = (request.args.get("q", "") or "").strip()
-    limit_param = request.args.get("limit")
-    final_limit = get_limit(limit_param, 99999)
-
-    conn = mysql_connect()
-    cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("""
-        SELECT profile_wish.*,
-               user_email_id,
-               profile_personal_first_name, profile_personal_last_name,
-               profile_personal_email_is_public, profile_personal_phone_number,
-               profile_personal_phone_number_is_public,
-               profile_personal_city, profile_personal_state, profile_personal_country,
-               profile_personal_location_is_public,
-               profile_personal_latitude, profile_personal_longitude,
-               profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public,
-               profile_personal_moderated
-        FROM profile_wish
-        LEFT JOIN every_circle.profile_personal
-            ON profile_personal_uid = profile_wish_profile_personal_id
-        LEFT JOIN every_circle.users
-            ON user_uid = profile_personal_user_id
-        WHERE profile_wish.profile_wish_is_public = 1
-          AND COALESCE(profile_wish.profile_wish_moderated, 0) = 0
-          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    ranked = []
-    for row in rows:
-        if not content_row_is_publicly_visible(row, "profile_wish_moderated"):
-            continue
-        row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
-        row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
-        row["score"] = wish_lexical_score(query, row)
-        if row["score"] < LEXICAL_MIN_SCORE:
-            continue
-        ranked.append(row)
-
-    ranked.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(ranked[:final_limit])
-
-
 @app.route("/search_wishes", methods=["GET"])
 def search_wishes():
     global wish_map
+    prepare_search_indexes()
     wish_map = sync_wishes(wish_map)
 
     query = (request.args.get("q", "") or "").strip()
@@ -1417,18 +1404,17 @@ def search_wishes():
     user_lon = safe_float(request.args.get("user_lon"))
     max_distance = safe_float(request.args.get("max_distance"))
 
-    max_results = 99999
-    final_limit = get_limit(limit_param, max_results)
+    final_limit = get_limit(limit_param, 99999)
+    candidate_limit = hybrid_candidate_limit(final_limit)
 
     if is_browse_query(query):
         response = fetch_browse_wishes(user_lat, user_lon, max_distance)
-        return jsonify(response[:final_limit])
+        return jsonify_categorized(response[:final_limit])
 
     vector = embed_text(query)
+    results = qdrant_hybrid_search("wishes", query, vector, candidate_limit)
 
-    results = qdrant_vector_search("wishes", query_vector=vector, limit=max_results)
-
-    wish_uids = [r.payload.get("profile_wish_uid") for r in results]
+    wish_uids = [r.payload.get("profile_wish_uid") for r in results if getattr(r, "payload", None)]
 
     additional_info = {}
 
@@ -1475,19 +1461,10 @@ def search_wishes():
 
             additional_info[row["profile_wish_uid"]] = row
 
-    merged_candidates = []
-    for r in results:
-        uid = r.payload.get("profile_wish_uid")
-        if wish_uids and uid not in additional_info:
-            continue
-        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
-        if uid in additional_info:
-            merged.update(additional_info[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
-        merged_candidates.append(merged)
-
-    apply_wish_rescore(query, merged_candidates)
-    boosted_candidates = filter_rescored_candidates(merged_candidates)
+    boosted_candidates = merge_hybrid_hits(results, "profile_wish_uid", additional_info)
+    annotate_hybrid_channels(
+        boosted_candidates, query, "profile_wish_uid", "wishes", candidate_limit
+    )
 
     response = []
     for obj in boosted_candidates:
@@ -1507,7 +1484,7 @@ def search_wishes():
         response.append(obj)
 
     response.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(response[:final_limit])
+    return jsonify_categorized(response[:final_limit])
 
 
 # ---------------------------------------------------------
@@ -1595,7 +1572,7 @@ def upsert_expertise(row):
         points=[
             PointStruct(
                 id=make_uuid(uid),
-                vector=embed_text(text),
+                vector=build_point_vectors(text),
                 payload=row
             )
         ]
@@ -1605,55 +1582,10 @@ def upsert_expertise(row):
 # ---------------------------------------------------------
 # SEARCH EXPERTISE
 # ---------------------------------------------------------
-def search_expertise_lexical():
-    query = (request.args.get("q", "") or "").strip()
-    limit_param = request.args.get("limit")
-    final_limit = get_limit(limit_param, 99999)
-
-    conn = mysql_connect()
-    cur = conn.cursor(pymysql.cursors.DictCursor)
-    cur.execute("""
-        SELECT profile_expertise.*,
-               user_email_id,
-               profile_personal_first_name, profile_personal_last_name,
-               profile_personal_email_is_public, profile_personal_phone_number,
-               profile_personal_phone_number_is_public,
-               profile_personal_city, profile_personal_state, profile_personal_country,
-               profile_personal_location_is_public,
-               profile_personal_latitude, profile_personal_longitude,
-               profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public,
-               profile_personal_moderated
-        FROM profile_expertise
-        LEFT JOIN every_circle.profile_personal
-            ON profile_personal_uid = profile_expertise_profile_personal_id
-        LEFT JOIN every_circle.users
-            ON user_uid = profile_personal_user_id
-        WHERE profile_expertise.profile_expertise_is_public = 1
-          AND COALESCE(profile_expertise.profile_expertise_moderated, 0) = 0
-          AND COALESCE(profile_personal.profile_personal_moderated, 0) = 0
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    ranked = []
-    for row in rows:
-        if not content_row_is_publicly_visible(row, "profile_expertise_moderated"):
-            continue
-        row["profile_personal_latitude"] = safe_float(row.get("profile_personal_latitude"))
-        row["profile_personal_longitude"] = safe_float(row.get("profile_personal_longitude"))
-        row["score"] = expertise_lexical_score(query, row)
-        if row["score"] < LEXICAL_MIN_SCORE:
-            continue
-        ranked.append(row)
-
-    ranked.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(ranked[:final_limit])
-
-
 @app.route("/search_expertise", methods=["GET"])
 def search_expertise():
     global exp_map
+    prepare_search_indexes()
     exp_map = sync_expertise(exp_map)
 
     query = (request.args.get("q", "") or "").strip()
@@ -1662,18 +1594,17 @@ def search_expertise():
     user_lon = safe_float(request.args.get("user_lon"))
     max_distance = safe_float(request.args.get("max_distance"))
 
-    max_results = 99999
-    final_limit = get_limit(limit_param, max_results)
+    final_limit = get_limit(limit_param, 99999)
+    candidate_limit = hybrid_candidate_limit(final_limit)
 
     if is_browse_query(query):
         response = fetch_browse_expertise(user_lat, user_lon, max_distance)
-        return jsonify(response[:final_limit])
+        return jsonify_categorized(response[:final_limit])
 
     vector = embed_text(query)
+    results = qdrant_hybrid_search("expertise", query, vector, candidate_limit)
 
-    results = qdrant_vector_search("expertise", query_vector=vector, limit=max_results)
-
-    exp_uids = [r.payload.get("profile_expertise_uid") for r in results]
+    exp_uids = [r.payload.get("profile_expertise_uid") for r in results if getattr(r, "payload", None)]
     additional_info = {}
 
     if exp_uids:
@@ -1719,19 +1650,10 @@ def search_expertise():
 
             additional_info[row["profile_expertise_uid"]] = row
 
-    merged_candidates = []
-    for r in results:
-        uid = r.payload.get("profile_expertise_uid")
-        if exp_uids and uid not in additional_info:
-            continue
-        merged = {**r.payload, "_sem_score": safe_float(r.score) or 0.0}
-        if uid in additional_info:
-            merged.update(additional_info[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
-        merged_candidates.append(merged)
-
-    apply_expertise_rescore(query, merged_candidates)
-    boosted_candidates = filter_rescored_candidates(merged_candidates)
+    boosted_candidates = merge_hybrid_hits(results, "profile_expertise_uid", additional_info)
+    annotate_hybrid_channels(
+        boosted_candidates, query, "profile_expertise_uid", "expertise", candidate_limit
+    )
 
     response = []
     for obj in boosted_candidates:
@@ -1751,7 +1673,7 @@ def search_expertise():
         response.append(obj)
 
     response.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
-    return jsonify(response[:final_limit])
+    return jsonify_categorized(response[:final_limit])
 
 
 # ---------------------------------------------------------
@@ -1760,6 +1682,7 @@ def search_expertise():
 @app.route("/search_global", methods=["GET"])
 def search_global():
     global biz_map, exp_map, wish_map
+    prepare_search_indexes()
     biz_map = sync_businesses(biz_map)
     exp_map = sync_expertise(exp_map)
     wish_map = sync_wishes(wish_map)
@@ -1772,8 +1695,8 @@ def search_global():
     min_rating = safe_float(request.args.get("min_rating"))
     max_rating = safe_float(request.args.get("max_rating"))
 
-    max_results = 99999
-    final_limit = get_limit(limit_param, max_results)
+    final_limit = get_limit(limit_param, 99999)
+    candidate_limit = hybrid_candidate_limit(final_limit)
 
     if is_browse_query(query):
         business_results = [{**row, "itemType": "businesses"} for row in fetch_browse_businesses(user_lat, user_lon, max_distance, min_rating, max_rating)]
@@ -1789,13 +1712,13 @@ def search_global():
         expertise_results = [{**row, "itemType": "expertise"} for row in fetch_browse_expertise(user_lat, user_lon, max_distance)]
         seeking_results = [{**row, "itemType": "seeking"} for row in fetch_browse_wishes(user_lat, user_lon, max_distance)]
         combined = business_results + expertise_results + seeking_results
-        return jsonify(combined[:final_limit])
+        return jsonify_categorized(combined[:final_limit])
 
     vector = embed_text(query)
 
     # --- businesses ---
-    biz_hits = qdrant_vector_search("businesses", query_vector=vector, limit=max_results)
-    biz_uids = [r.payload.get("business_uid") for r in biz_hits]
+    biz_hits = qdrant_hybrid_search("businesses", query, vector, candidate_limit)
+    biz_uids = [r.payload.get("business_uid") for r in biz_hits if getattr(r, "payload", None)]
     biz_rows = {}
     if biz_uids:
         conn = mysql_connect()
@@ -1820,15 +1743,12 @@ def search_global():
             row["business_longitude"] = safe_float(row.get("business_longitude"))
             biz_rows[row["business_uid"]] = row
 
-    merged_business_results = []
-    for r in biz_hits:
-        uid = r.payload.get("business_uid")
-        if biz_uids and uid not in biz_rows:
-            continue
-        merged = {"itemType": "businesses", **r.payload, "_sem_score": safe_float(r.score) or 0.0}
-        if uid in biz_rows:
-            merged.update(biz_rows[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
+    biz_merged = merge_hybrid_hits(biz_hits, "business_uid", biz_rows)
+    annotate_hybrid_channels(biz_merged, query, "business_uid", "businesses", candidate_limit)
+
+    business_results = []
+    for merged in biz_merged:
+        merged["itemType"] = "businesses"
 
         rating = safe_float(merged.get("business_google_rating"))
         if rating is not None:
@@ -1849,25 +1769,21 @@ def search_global():
         if dist is not None:
             merged["distance_miles"] = dist
 
-        merged_business_results.append(merged)
-
-    apply_business_rescore(query, merged_business_results)
-
-    business_results = filter_rescored_candidates(merged_business_results)
-    for item in business_results:
         apply_home_proximity_boost(
-            item,
+            merged,
             user_lat,
             user_lon,
             max_distance,
             "business_latitude",
             "business_longitude",
         )
+        business_results.append(merged)
+
     business_results.sort(key=lambda x: safe_float(x.get("score")) or 0.0, reverse=True)
 
     # --- expertise ---
-    exp_hits = qdrant_vector_search("expertise", query_vector=vector, limit=max_results)
-    exp_uids = [r.payload.get("profile_expertise_uid") for r in exp_hits]
+    exp_hits = qdrant_hybrid_search("expertise", query, vector, candidate_limit)
+    exp_uids = [r.payload.get("profile_expertise_uid") for r in exp_hits if getattr(r, "payload", None)]
     exp_rows = {}
     if exp_uids:
         conn = mysql_connect()
@@ -1907,20 +1823,14 @@ def search_global():
             row["profile_expertise_longitude"] = safe_float(row.get("profile_expertise_longitude"))
             exp_rows[row["profile_expertise_uid"]] = row
 
-    merged_expertise_results = []
-    for r in exp_hits:
-        uid = r.payload.get("profile_expertise_uid")
-        if exp_uids and uid not in exp_rows:
-            continue
-        merged = {
-            "itemType": "expertise",
-            **r.payload,
-            "_sem_score": safe_float(r.score) or 0.0,
-        }
-        if uid in exp_rows:
-            merged.update(exp_rows[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
+    exp_merged = merge_hybrid_hits(exp_hits, "profile_expertise_uid", exp_rows)
+    annotate_hybrid_channels(
+        exp_merged, query, "profile_expertise_uid", "expertise", candidate_limit
+    )
 
+    expertise_results = []
+    for merged in exp_merged:
+        merged["itemType"] = "expertise"
         exp_lat, exp_lon = expertise_effective_coords(merged)
         include, dist = distance_filter_passes(
             user_lat,
@@ -1933,15 +1843,11 @@ def search_global():
             continue
         if dist is not None:
             merged["distance_miles"] = dist
-
-        merged_expertise_results.append(merged)
-
-    apply_expertise_rescore(query, merged_expertise_results)
-    expertise_results = filter_rescored_candidates(merged_expertise_results)
+        expertise_results.append(merged)
 
     # --- seeking (wishes) ---
-    wish_hits = qdrant_vector_search("wishes", query_vector=vector, limit=max_results)
-    wish_uids = [r.payload.get("profile_wish_uid") for r in wish_hits]
+    wish_hits = qdrant_hybrid_search("wishes", query, vector, candidate_limit)
+    wish_uids = [r.payload.get("profile_wish_uid") for r in wish_hits if getattr(r, "payload", None)]
     wish_rows = {}
     if wish_uids:
         conn = mysql_connect()
@@ -1981,20 +1887,12 @@ def search_global():
             row["profile_wish_longitude"] = safe_float(row.get("profile_wish_longitude"))
             wish_rows[row["profile_wish_uid"]] = row
 
-    merged_seeking_results = []
-    for r in wish_hits:
-        uid = r.payload.get("profile_wish_uid")
-        if wish_uids and uid not in wish_rows:
-            continue
-        merged = {
-            "itemType": "seeking",
-            **r.payload,
-            "_sem_score": safe_float(r.score) or 0.0,
-        }
-        if uid in wish_rows:
-            merged.update(wish_rows[uid])
-            merged["_sem_score"] = safe_float(r.score) or 0.0
+    wish_merged = merge_hybrid_hits(wish_hits, "profile_wish_uid", wish_rows)
+    annotate_hybrid_channels(wish_merged, query, "profile_wish_uid", "wishes", candidate_limit)
 
+    seeking_results = []
+    for merged in wish_merged:
+        merged["itemType"] = "seeking"
         wish_lat, wish_lon = wish_effective_coords(merged)
         include, dist = distance_filter_passes(
             user_lat,
@@ -2007,11 +1905,7 @@ def search_global():
             continue
         if dist is not None:
             merged["distance_miles"] = dist
-
-        merged_seeking_results.append(merged)
-
-    apply_wish_rescore(query, merged_seeking_results)
-    seeking_results = filter_rescored_candidates(merged_seeking_results)
+        seeking_results.append(merged)
 
     for item in business_results:
         base = safe_float(item.get("score")) or 0.0
@@ -2025,7 +1919,7 @@ def search_global():
 
     combined = business_results + expertise_results + seeking_results
     combined.sort(key=lambda x: safe_float(x.get("global_score")) or 0.0, reverse=True)
-    return jsonify(combined[:final_limit])
+    return jsonify_categorized(combined[:final_limit])
 
 
 # ---------------------------------------------------------
@@ -2123,11 +2017,7 @@ def search_suggest():
 # MAIN
 # ---------------------------------------------------------
 if __name__ == "__main__":
-    ensure_collections()
-
-    global biz_map, wish_map, exp_map
-    biz_map = {}
-    wish_map = {}
-    exp_map = {}
+    prepare_search_indexes()
+    reset_sync_maps()
 
     app.run(host="0.0.0.0", port=5001)
