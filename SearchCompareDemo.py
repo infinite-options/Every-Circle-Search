@@ -9,7 +9,7 @@ Same routes/shape as QdrntTest so the app can point SEARCH_BASE_URL here:
   GET /search_suggest
 
 Ranking: Qdrant dense + BM25 fused with native RRF (same as production), plus
-existing proximity / global type weights.
+global type weights. Location is a hard radius filter only (no proximity boost).
 
 Each hit includes normalized channel scores in score_breakdown:
   dense_score / semantic_score  — MiniLM cosine, clipped to 0–1
@@ -18,7 +18,7 @@ Each hit includes normalized channel scores in score_breakdown:
   lexical_score                 — fuzzy mix, already 0–1
   dense_sparse_score            — Qdrant RRF of dense + BM25, 0–1
   semantic_lexical_score        — Python RRF of semantic + fuzzy lexical, 0–1
-  legacy_boosts                 — old token/phrase boosts + proximity flag
+  legacy_boosts                 — old token/phrase boosts
   legacy_additive_score         — old additive mode: semantic + those boosts
 
 Search endpoints return { results, search_categories } with four buckets:
@@ -59,8 +59,8 @@ SEMANTIC_CATEGORY_MIN = qt._env_float("SEMANTIC_CATEGORY_MIN", 0.4)
 EXACT_MATCH_MIN_TOKEN_LEN = int(os.getenv("EXACT_MATCH_MIN_TOKEN_LEN", "3"))
 # Substring containment ("games" in "gamestop"). Longer floor avoids "art"→"party".
 CONTAINS_MATCH_MIN_TOKEN_LEN = int(os.getenv("CONTAINS_MATCH_MIN_TOKEN_LEN", "4"))
-# Multiplicative lift on fused RRF, stacked with proximity (×1.12). 1.20 is a
-# stronger content signal than nearby-home without flattening BM25 order.
+# Multiplicative lift on fused RRF when query tokens match document text.
+# 1.20 is a moderate content signal without flattening BM25 order.
 EXACT_MATCH_BOOST_FACTOR = qt._env_float("EXACT_MATCH_BOOST_FACTOR", 1.20)
 
 SEARCH_CATEGORY_META = (
@@ -173,7 +173,7 @@ def detect_exact_match(query: str, row: dict, uid_field: str) -> dict:
 
 
 def apply_exact_match_boost(rows: List[dict], query: str, uid_field: str) -> None:
-    """Lift fused score after RRF; proximity may multiply this further."""
+    """Lift fused score after RRF when query tokens match document text."""
     for row in rows:
         details = detect_exact_match(query, row, uid_field)
         breakdown = row.get("score_breakdown")
@@ -476,15 +476,6 @@ def apply_business_filters(rows: List[dict], args: dict) -> List[dict]:
         if dist is not None:
             merged["distance_miles"] = dist
 
-        qt.apply_home_proximity_boost(
-            merged,
-            args["user_lat"],
-            args["user_lon"],
-            args["max_distance"],
-            "business_latitude",
-            "business_longitude",
-        )
-
         rating = qt.safe_float(merged.get("business_google_rating"))
         if rating is not None:
             if args["min_rating"] is not None and rating < args["min_rating"]:
@@ -642,9 +633,6 @@ def attach_channel_scores(
                 "legacy_boosts": {
                     **token_boosts,
                     "scaled_lexical_boost": scaled_lex_boost,
-                    "proximity_boost": False,
-                    "proximity_boost_factor": None,
-                    "proximity_boost_miles": None,
                 },
             }
         )
@@ -693,25 +681,6 @@ def jsonify_categorized(rows: List[dict]):
     return jsonify({"results": rows, "search_categories": categories})
 
 
-def copy_proximity_into_legacy_boosts(rows: List[dict]) -> None:
-    """Record proximity as a legacy boost only; do not fold it into channel/fused scores."""
-    for row in rows:
-        breakdown = row.get("score_breakdown")
-        if not isinstance(breakdown, dict):
-            continue
-        boosts = breakdown.get("legacy_boosts")
-        if not isinstance(boosts, dict):
-            boosts = {}
-            breakdown["legacy_boosts"] = boosts
-        applied = bool(row.get("location_boosted") or breakdown.get("proximity_boost"))
-        boosts["proximity_boost"] = applied
-        boosts["proximity_boost_factor"] = (
-            qt.safe_float(breakdown.get("proximity_boost_factor")) or qt.PROXIMITY_BOOST_FACTOR if applied else None
-        )
-        boosts["proximity_boost_miles"] = breakdown.get("proximity_boost_miles") if applied else None
-
-
-
 def retrieve_hybrid_with_channels(
     collection_name: str,
     uid_field: str,
@@ -754,15 +723,6 @@ def search_business_rows(args: dict) -> List[dict]:
         filtered = qt.fetch_browse_businesses(
             args["user_lat"], args["user_lon"], args["max_distance"], args["min_rating"], args["max_rating"]
         )
-        for merged in filtered:
-            qt.apply_home_proximity_boost(
-                merged,
-                args["user_lat"],
-                args["user_lon"],
-                args["max_distance"],
-                "business_latitude",
-                "business_longitude",
-            )
         return filtered[: args["final_limit"]]
 
     rows = retrieve_hybrid_with_channels(
@@ -774,7 +734,6 @@ def search_business_rows(args: dict) -> List[dict]:
         business_lexical_score,
     )
     rows = apply_business_filters(rows, args)
-    copy_proximity_into_legacy_boosts(rows)
     return rows[: args["final_limit"]]
 
 
@@ -795,7 +754,6 @@ def search_expertise_rows(args: dict) -> List[dict]:
         expertise_lexical_score,
     )
     rows = apply_expertise_filters(rows, args)
-    copy_proximity_into_legacy_boosts(rows)
     return rows[: args["final_limit"]]
 
 
@@ -816,7 +774,6 @@ def search_wish_rows(args: dict) -> List[dict]:
         wish_lexical_score,
     )
     rows = apply_wish_filters(rows, args)
-    copy_proximity_into_legacy_boosts(rows)
     return rows[: args["final_limit"]]
 
 
@@ -848,15 +805,6 @@ def search_global():
                 args["user_lat"], args["user_lon"], args["max_distance"], args["min_rating"], args["max_rating"]
             )
         ]
-        for item in business_results:
-            qt.apply_home_proximity_boost(
-                item,
-                args["user_lat"],
-                args["user_lon"],
-                args["max_distance"],
-                "business_latitude",
-                "business_longitude",
-            )
         expertise_results = [
             {**row, "itemType": "expertise"}
             for row in qt.fetch_browse_expertise(args["user_lat"], args["user_lon"], args["max_distance"])
