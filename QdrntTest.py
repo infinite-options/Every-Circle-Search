@@ -693,12 +693,10 @@ def fetch_browse_expertise(user_lat, user_lon, max_distance):
                user_email_id,
                profile_personal_first_name, profile_personal_last_name,
                profile_personal_phone_number,
-               profile_personal_phone_number_is_public,
                profile_personal_city, profile_personal_state, profile_personal_country,
-               profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
-               profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_image,
+               profile_personal_tag_line,
                profile_personal_moderated
         FROM profile_expertise
         LEFT JOIN every_circle.profile_personal
@@ -748,12 +746,10 @@ def fetch_browse_wishes(user_lat, user_lon, max_distance):
                user_email_id,
                profile_personal_first_name, profile_personal_last_name,
                profile_personal_phone_number,
-               profile_personal_phone_number_is_public,
                profile_personal_city, profile_personal_state, profile_personal_country,
-               profile_personal_location_is_public,
                profile_personal_latitude, profile_personal_longitude,
-               profile_personal_image, profile_personal_image_is_public,
-               profile_personal_tag_line, profile_personal_tag_line_is_public,
+               profile_personal_image,
+               profile_personal_tag_line,
                profile_personal_moderated
         FROM profile_wish
         LEFT JOIN every_circle.profile_personal
@@ -1374,12 +1370,10 @@ def search_wishes():
                    user_email_id,
                    profile_personal_first_name, profile_personal_last_name,
                    profile_personal_phone_number,
-                   profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
-                   profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+                   profile_personal_image,
+                   profile_personal_tag_line,
                profile_personal_moderated
             FROM profile_wish
             LEFT JOIN every_circle.profile_personal
@@ -1563,12 +1557,10 @@ def search_expertise():
                    user_email_id,
                    profile_personal_first_name, profile_personal_last_name,
                    profile_personal_phone_number,
-                   profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
-                   profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+                   profile_personal_image,
+                   profile_personal_tag_line,
                profile_personal_moderated
             FROM profile_expertise
             LEFT JOIN every_circle.profile_personal
@@ -1723,12 +1715,10 @@ def search_global():
                    user_email_id,
                    profile_personal_first_name, profile_personal_last_name,
                    profile_personal_phone_number,
-                   profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
-                   profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+                   profile_personal_image,
+                   profile_personal_tag_line,
                profile_personal_moderated
             FROM profile_expertise
             LEFT JOIN every_circle.profile_personal
@@ -1787,12 +1777,10 @@ def search_global():
                    user_email_id,
                    profile_personal_first_name, profile_personal_last_name,
                    profile_personal_phone_number,
-                   profile_personal_phone_number_is_public,
                    profile_personal_city, profile_personal_state, profile_personal_country,
-                   profile_personal_location_is_public,
                    profile_personal_latitude, profile_personal_longitude,
-                   profile_personal_image, profile_personal_image_is_public,
-                   profile_personal_tag_line, profile_personal_tag_line_is_public,
+                   profile_personal_image,
+                   profile_personal_tag_line,
                profile_personal_moderated
             FROM profile_wish
             LEFT JOIN every_circle.profile_personal
